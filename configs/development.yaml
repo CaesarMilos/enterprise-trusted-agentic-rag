@@ -1,0 +1,18 @@
+extends: default.yaml
+application:
+  environment: development
+  debug: true
+
+security:
+  demo_auth_enabled: true
+
+llm:
+  model: qwen3:8b
+
+ingestion:
+  # 中文：本地验证可开启 LLM 模糊边界复核；生产环境应先用评估集验收。
+  # English: Local validation may review ambiguous boundaries with the LLM; evaluate first.
+  llm_boundary_enabled: true
+
+retrieval:
+  reranker_enabled: false

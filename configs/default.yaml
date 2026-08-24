@@ -1,0 +1,73 @@
+config_version: "1.0"
+application:
+  name: enterprise-trusted-agentic-rag
+  environment: production
+
+storage:
+  upload_dir: data/uploads
+  index_dir: data/indexes
+  trace_dir: data/traces
+  database_url: sqlite:///./data/database/enterprise_rag.db
+
+ingestion:
+  allowed_extensions: [pdf, md, txt]
+  max_file_size_mb: 50
+  chunker_version: adaptive-profile-strategy-v2
+  min_chunk_tokens: 150
+  target_chunk_tokens: 400
+  max_chunk_tokens: 700
+  semantic_boundary_threshold: 0.52
+  semantic_ambiguity_margin: 0.08
+  llm_boundary_enabled: false
+  llm_boundary_max_calls: 8
+  parent_chunks_enabled: true
+  job_lease_seconds: 300
+  job_heartbeat_seconds: 60
+  max_request_body_size_mb: 55
+
+embedding:
+  provider: local
+  model: BAAI/bge-small-zh-v1.5
+  dimension: 0
+  batch_size: 32
+  base_url: null
+  api_key_env: EMBEDDING_API_KEY
+
+ocr:
+  enabled: false
+  provider: tesseract
+  language: chi_sim+eng
+  dpi: 250
+  minimum_confidence: 0.75
+
+retrieval:
+  dense_candidate_k: 30
+  bm25_candidate_k: 30
+  rrf_k: 60
+  min_k: 3
+  default_k: 5
+  max_k: 10
+  reranker_enabled: true
+  reranker_model: BAAI/bge-reranker-base
+  context_token_budget: 6000
+
+agent:
+  max_retrieval_retries: 2
+  max_model_calls: 8
+  max_total_tokens: 24000
+  timeout_seconds: 60
+
+llm:
+  provider: openai-compatible
+  model: gpt-4.1-mini
+  base_url: http://localhost:11434/v1
+  api_key_env: LLM_API_KEY
+  request_timeout_seconds: 45
+  temperature: 0.0
+
+security:
+  default_tenant_id: demo-tenant
+  enforce_access_scope: true
+  demo_auth_enabled: false
+  trusted_proxy_auth_enabled: false
+  trusted_proxy_secret_env: ENTERPRISE_RAG_PROXY_SECRET

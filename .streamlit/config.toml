@@ -1,0 +1,4 @@
+# 中文：Streamlit 上传上限与 FastAPI 接入上限保持一致，避免前后端显示冲突。
+# English: Keep the Streamlit upload ceiling aligned with the FastAPI ingestion limit.
+[server]
+maxUploadSize = 50

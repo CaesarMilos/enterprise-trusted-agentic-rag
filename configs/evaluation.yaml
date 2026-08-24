@@ -1,0 +1,14 @@
+extends: default.yaml
+application:
+  environment: evaluation
+
+security:
+  demo_auth_enabled: false
+
+retrieval:
+  reranker_enabled: true
+
+evaluation:
+  random_seed: 42
+  dataset_path: tests/fixtures/evaluation_dataset.json
+  output_dir: reports
