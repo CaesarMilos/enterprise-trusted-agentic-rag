@@ -24,7 +24,7 @@ from enterprise_rag.core.config import (
     Settings,
     StorageSettings,
 )
-from enterprise_rag.core.enums import ContentProfile, SourceVisibility
+from enterprise_rag.core.enums import AuthenticationMode, ContentProfile, SourceVisibility
 from enterprise_rag.domain.models import Source
 from enterprise_rag.domain.protocols.models import ModelResponse, ModelUsage
 from enterprise_rag.infrastructure.persistence.database import transactional_session
@@ -165,6 +165,7 @@ def _settings(tmp_path: Path) -> Settings:
             max_k=3,
             reranker_enabled=False,
             context_token_budget=512,
+            max_parent_tokens=256,
         ),
         agent=AgentSettings(
             max_retrieval_retries=0,
@@ -174,6 +175,7 @@ def _settings(tmp_path: Path) -> Settings:
         ),
         security=SecuritySettings(
             default_tenant_id="e2e-tenant",
+            authentication_mode=AuthenticationMode.DEMO,
             demo_auth_enabled=True,
         ),
     )
@@ -234,7 +236,7 @@ def test_upload_worker_faiss_and_chat_flow(
                         "在执行设备维护前，操作人员必须断开设备电源，"
                         "并确认指示灯已经熄灭。\n\n"
                         "完成维护并检查防护装置后，方可重新接通电源。"
-                    ).encode("utf-8"),
+                    ).encode(),
                     "text/plain",
                 )
             },

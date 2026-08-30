@@ -1,0 +1,36 @@
+# 中文：开发编排只绑定本机回环地址，并明确启用不可用于生产的 Demo 认证。
+# English: Development binds loopback only and explicitly enables non-production demo auth.
+services:
+  api:
+    build: .
+    environment: &development_environment
+      ENTERPRISE_RAG_ENV: development
+      LLM_API_KEY: ${LLM_API_KEY:-ollama}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - enterprise_dev_data:/app/data
+      - model_cache:/app/.cache
+
+  worker:
+    build: .
+    command: ["python", "scripts/run_worker.py"]
+    environment: *development_environment
+    volumes:
+      - enterprise_dev_data:/app/data
+      - model_cache:/app/.cache
+    depends_on: [api]
+
+  ui:
+    build: .
+    command: ["streamlit", "run", "src/enterprise_rag/ui/streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    environment:
+      ENTERPRISE_RAG_API_URL: http://api:8000/api/v1
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on: [api]
+
+volumes:
+  enterprise_dev_data:
+  model_cache:

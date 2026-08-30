@@ -24,3 +24,4 @@ reports/*
 !data/database/.gitkeep
 !reports/.gitkeep
 
+/*.pdf

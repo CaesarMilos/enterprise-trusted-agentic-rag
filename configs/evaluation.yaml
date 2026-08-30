@@ -3,7 +3,9 @@ application:
   environment: evaluation
 
 security:
+  authentication_mode: jwt
   demo_auth_enabled: false
+  trusted_proxy_auth_enabled: false
 
 retrieval:
   reranker_enabled: true

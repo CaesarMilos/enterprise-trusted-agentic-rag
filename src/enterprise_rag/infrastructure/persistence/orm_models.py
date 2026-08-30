@@ -130,6 +130,15 @@ class DocumentRow(Base):
     # English: Active immutable version, intentionally added without circular foreign-key
     #   enforcement.
     active_version_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # 中文：删除时原子递增，用于阻断所有旧任务和旧索引发布计划。
+    # English: Atomically incremented on deletion to fence every stale job and publication plan.
+    lifecycle_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # 中文：删除请求和完成时间把逻辑状态与物理清理过程分开记录。
+    # English: Request/completion timestamps separate logical state from physical cleanup.
+    delete_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 中文：变量 `created_at` 用于保存“`created``at`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Audit creation time.
@@ -304,6 +313,9 @@ class IngestionJobRow(Base):
         ForeignKey("document_versions.id"),
         index=True,
     )
+    # 中文：入队时文档 generation 快照，与 Worker 租约代次共同构成 fencing token。
+    # English: Enqueue-time document generation combines with the lease attempt as a fence.
+    document_generation_snapshot: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # 中文：变量 `status` 用于保存“状态”相关数据；其精确定义与约束见下方英文说明。
     # English: Serialized JobStatus value.
     status: Mapped[str] = mapped_column(String(32), default=JobStatus.PENDING.value)
@@ -328,6 +340,12 @@ class IngestionJobRow(Base):
     # 中文：变量 `error_message` 用于保存“错误消息”相关数据；其精确定义与约束见下方英文说明。
     # English: Safe redacted failure message.
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 中文：运行任务在阶段检查点读取持久取消标志并安全收口。
+    # English: Running jobs observe durable cancellation at stage checkpoints and stop safely.
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # 中文：变量 `created_at` 用于保存“`created``at`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: FIFO creation time.
@@ -381,6 +399,13 @@ class IndexVersionRow(Base):
     activated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+    # 中文：候选发布失败和取消必须保存终态原因，避免永久 STAGING。
+    # English: Failed and cancelled candidates persist terminal reasons and never remain STAGING.
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

@@ -83,10 +83,35 @@ class DocumentRepository(Protocol):
         document_id: str,
         status: DocumentStatus,
         active_version_id: str | None = None,
+        expected_generation: int | None = None,
     ) -> None:
         """中文：该函数或方法负责“设置状态”相关处理。
 
         English: Update lifecycle state and optionally activate an immutable version.
+        """
+
+    def request_deletion(
+        self,
+        tenant_id: str,
+        document_id: str,
+        now: datetime,
+        reason: str = "document_deleted",
+    ) -> Document | None:
+        """中文：递增生命周期代次、进入删除态并取消相关任务。
+
+        English: Increment lifecycle generation, enter deletion, and cancel related jobs.
+        """
+
+    def complete_deletion(
+        self,
+        tenant_id: str,
+        document_id: str,
+        generation: int,
+        now: datetime,
+    ) -> None:
+        """中文：在 generation 匹配时完成删除闭环。
+
+        English: Complete the deletion lifecycle when the generation still matches.
         """
 
     def list_active_versions(self, tenant_id: str) -> Sequence[DocumentVersion]:
@@ -227,6 +252,12 @@ class IngestionJobRepository(Protocol):
         """中文：该函数或方法负责“标记失败的”相关处理。
 
         English: Mark a leased job as failed with safe diagnostics.
+        """
+
+    def mark_cancelled(self, fence: JobFence, now: datetime, reason: str) -> None:
+        """中文：把当前运行任务收口为已取消。
+
+        English: Move the current running job to the cancelled terminal state.
         """
 
     def mark_attention_required(

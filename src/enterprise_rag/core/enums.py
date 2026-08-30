@@ -50,6 +50,9 @@ class JobStatus(StrEnum):
     # English: The input is explicitly unsupported by the current version.
     UNSUPPORTED = "unsupported"
     FAILED = "failed"
+    # 中文：任务在发布前响应删除或管理员请求而终止，不能继续写入文档或索引。
+    # English: The job stopped before publication after deletion or an administrator request.
+    CANCELLED = "cancelled"
 
 
 class IndexStatus(StrEnum):
@@ -63,6 +66,12 @@ class IndexStatus(StrEnum):
     ACTIVE = "active"
     RETIRED = "retired"
     FAILED = "failed"
+    # 中文：候选索引因生命周期 fencing 或显式取消而停止发布。
+    # English: A candidate publication stopped because of lifecycle fencing or cancellation.
+    CANCELLED = "cancelled"
+    # 中文：失败或取消的索引制品已完成物理回收，仅保留审计记录。
+    # English: Failed or cancelled artifacts were physically removed while audit data remains.
+    PURGED = "purged"
 
 
 class AgentStatus(StrEnum):
@@ -126,6 +135,10 @@ class RefusalReason(StrEnum):
     UNSUPPORTED_REQUEST = "unsupported_request"
     UNSAFE_REQUEST = "unsafe_request"
     ACCESS_DENIED = "access_denied"
+    EVIDENCE_CONFIDENCE_LOW = "evidence_confidence_low"
+    DOCUMENT_PROCESSING = "document_processing"
+    DOCUMENT_NEEDS_OCR = "document_needs_ocr"
+    DEADLINE_EXCEEDED = "deadline_exceeded"
 
 
 class SourceVisibility(StrEnum):
@@ -154,3 +167,23 @@ class ContentProfile(StrEnum):
     # 中文：API、配置、运维、开发和技术规范类文档。
     # English: API, configuration, operations, development, and specification documents.
     TECHNICAL_DOC = "technical_doc"
+    # 中文：法规、制度、合同和政策文本，以编章节条款项作为强结构边界。
+    # English: Regulations, policies, and contracts use article and clause boundaries.
+    REGULATION = "regulation"
+    # 中文：论文、研究报告和白皮书按摘要、章节、方法与结论组织。
+    # English: Papers and reports are organized by abstract, sections, methods, and conclusions.
+    ACADEMIC = "academic"
+    # 中文：叙事材料以章节、场景和自然段作为主要边界。
+    # English: Narrative material uses chapters, scenes, and paragraphs as primary boundaries.
+    NARRATIVE = "narrative"
+
+
+class AuthenticationMode(StrEnum):
+    """中文：定义互斥认证模式，禁止生产环境混用可信与不可信身份来源。
+
+    English: Define mutually exclusive authentication modes and identity trust boundaries.
+    """
+
+    DEMO = "demo"
+    JWT = "jwt"
+    TRUSTED_PROXY = "trusted_proxy"

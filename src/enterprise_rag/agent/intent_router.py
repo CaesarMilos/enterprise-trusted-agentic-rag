@@ -22,7 +22,7 @@ _CAPABILITY_PATTERN = re.compile(
 _SMALL_TALK_PATTERN = re.compile(r"(?i)^(hi|hello|hey|thanks|thank you|你好|谢谢)[!,.，。！\s]*$")
 # 中文：变量 `_UNSUPPORTED_PATTERN` 用于保存“`unsupported``pattern`”相关数据；
 # 其精确定义与约束见下方英文说明。
-# English: Unsupported real-time requests are outside the frozen V0.3 data-source boundary.
+# English: Unsupported real-time requests are outside the frozen V4 data-source boundary.
 _UNSUPPORTED_PATTERN = re.compile(
     r"(?i)\b(latest news|stock price|weather|browse the web|internet search)\b|"
     r"(最新新闻|股价|天气|搜索互联网|联网搜索)"

@@ -38,6 +38,7 @@ def test_environment_values_have_highest_precedence() -> None:
     settings = load_settings(_DEFAULT_CONFIG, _DEVELOPMENT_CONFIG, environ=environ)
 
     assert settings.application.environment == "development"
+    assert settings.config_version == "4.0"
     assert settings.retrieval.max_k == 8
     assert settings.agent.timeout_seconds == 15
     assert settings.storage.upload_dir.is_absolute()

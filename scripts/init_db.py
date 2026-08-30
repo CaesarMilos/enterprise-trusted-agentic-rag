@@ -32,7 +32,7 @@ def main() -> None:
         "--content-profile",
         choices=tuple(profile.value for profile in ContentProfile),
         default=ContentProfile.GENERAL_PROSE.value,
-        help="Source content profile selecting the V0.3 adaptive chunk strategy.",
+        help="Source content profile selecting the V4 adaptive chunk strategy.",
     )
     # 中文：变量 `arguments` 用于保存“`arguments`”相关数据；其精确定义与约束见下方英文说明。
     # English: Parsed arguments determine only development seed metadata.

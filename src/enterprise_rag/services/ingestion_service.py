@@ -5,6 +5,8 @@ English: Accept validated uploads, persist original bytes, and create durable in
 
 from __future__ import annotations
 
+from typing import TypedDict
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -27,6 +29,20 @@ from enterprise_rag.infrastructure.persistence.orm_models import (
 from enterprise_rag.infrastructure.persistence.repositories import SQLAlchemyRepositories
 from enterprise_rag.ingestion.chunk_strategies import ChunkStrategyRegistry
 from enterprise_rag.ingestion.validator import UploadValidator
+
+
+class _VersionSnapshotFields(TypedDict):
+    """中文：精确描述 DocumentVersion 构造器展开的冻结策略字段。
+
+    English: Precisely type frozen strategy fields expanded into DocumentVersion construction.
+    """
+
+    content_profile: ContentProfile
+    chunk_strategy_id: str
+    chunk_strategy_version: str
+    chunk_parameters: dict[str, object]
+    embedding_fingerprint: str
+    boundary_model_fingerprint: str | None
 
 
 class IngestionService:
@@ -154,6 +170,7 @@ class IngestionService:
                     tenant_id=command.user.tenant_id,
                     document_id=document_id,
                     document_version_id=version_id,
+                    document_generation_snapshot=document.lifecycle_generation,
                     status=JobStatus.PENDING,
                 )
                 repositories.add_document(document)
@@ -203,6 +220,14 @@ class IngestionService:
                         "The document does not exist or cannot be retried.",
                     )
                 )
+            if document.status in {DocumentStatus.PENDING_DELETE, DocumentStatus.DELETED}:
+                raise ValidationError(
+                    error_detail(
+                        "DOCUMENT_NOT_RETRYABLE",
+                        ErrorCategory.VALIDATION,
+                        "A deleting or deleted document cannot be retried.",
+                    )
+                )
             # 中文：关键变量 `failed_job_row` 选择最新失败候选任务，而非假设逻辑文档也失败。
             # English: Key variable `failed_job_row` selects the latest failed candidate job
             # instead of assuming the logical document also failed.
@@ -248,6 +273,7 @@ class IngestionService:
                     tenant_id=command.user.tenant_id,
                     document_id=document.id,
                     document_version_id=version.id,
+                    document_generation_snapshot=document.lifecycle_generation,
                     status=JobStatus.PENDING,
                 )
             )
@@ -303,6 +329,14 @@ class IngestionService:
                         "The document does not exist.",
                     )
                 )
+            if document.status in {DocumentStatus.PENDING_DELETE, DocumentStatus.DELETED}:
+                raise ValidationError(
+                    error_detail(
+                        "DOCUMENT_NOT_REPROCESSABLE",
+                        ErrorCategory.VALIDATION,
+                        "A deleting or deleted document cannot be reprocessed.",
+                    )
+                )
             source = repositories.get_source(command.user.tenant_id, document.source_id)
             if source is None or not source.is_active:
                 raise ValidationError(
@@ -352,6 +386,7 @@ class IngestionService:
                     tenant_id=command.user.tenant_id,
                     document_id=document.id,
                     document_version_id=version_id,
+                    document_generation_snapshot=document.lifecycle_generation,
                     status=JobStatus.PENDING,
                 )
             )
@@ -378,7 +413,7 @@ class IngestionService:
         self,
         content_profile: ContentProfile,
         strategy_override: str | None,
-    ) -> dict[str, object]:
+    ) -> _VersionSnapshotFields:
         """中文：解析并返回写入 DocumentVersion 的不可变接入策略快照字段。
 
         English: Resolve and return immutable ingestion-strategy fields for DocumentVersion.
@@ -390,14 +425,17 @@ class IngestionService:
             strategy_id = strategy.strategy_id
             strategy_version = strategy.version
         else:
-            # 中文：兼容旧单元测试构造方式；生产容器始终注入注册表。
-            # English: Preserve legacy unit-test construction; production always injects registry.
+            # 中文：兼容简化单元测试构造方式；生产容器始终注入注册表。
+            # English: Preserve simple unit-test construction; production always injects registry.
             strategy_id = strategy_override or {
                 ContentProfile.GENERAL_PROSE: "general-prose",
                 ContentProfile.MANUAL: "manual-structure",
                 ContentProfile.TECHNICAL_DOC: "technical-document",
+                ContentProfile.REGULATION: "regulation-structure",
+                ContentProfile.ACADEMIC: "academic-structure",
+                ContentProfile.NARRATIVE: "narrative-structure",
             }[profile]
-            strategy_version = f"{strategy_id}-v2"
+            strategy_version = f"{strategy_id}-v4"
         return {
             "content_profile": profile,
             "chunk_strategy_id": strategy_id,

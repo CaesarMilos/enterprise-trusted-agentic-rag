@@ -81,10 +81,12 @@ class LLMProvider(Protocol):
         system_prompt: str,
         user_prompt: str,
         metadata: Mapping[str, str] | None = None,
+        *,
+        timeout_seconds: float | None = None,
     ) -> ModelResponse:
         """中文：该函数或方法负责“完成一次模型调用”相关处理。
 
-        English: Generate one bounded response for a system and user prompt.
+        English: Generate one response capped by an optional remaining global deadline.
         """
 
 

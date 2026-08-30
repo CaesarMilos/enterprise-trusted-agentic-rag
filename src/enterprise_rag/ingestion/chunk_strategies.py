@@ -16,6 +16,7 @@ from enterprise_rag.ingestion.boundary_analyzer import (
     LLMBoundaryJudge,
     SimilarityProvider,
 )
+from enterprise_rag.ingestion.chunking.boundary_scorer import BoundaryWeights
 from enterprise_rag.ingestion.semantic_chunker import ChunkingContext, DynamicSemanticChunker
 from enterprise_rag.ingestion.structure_parser import StructuredUnit
 
@@ -82,6 +83,8 @@ class ProfileChunkStrategy:
         llm_judge: LLMBoundaryJudge | None = None,
         create_parent_chunks: bool = True,
         max_llm_boundaries: int = 8,
+        base_boundary_threshold: float = 0.58,
+        boundary_weights: BoundaryWeights | None = None,
     ) -> None:
         """中文：保存不可变策略身份、结构规则与 Token 预算。
 
@@ -108,6 +111,8 @@ class ProfileChunkStrategy:
             ambiguity_margin=ambiguity_margin,
             similarity_provider=similarity_provider,
             llm_judge=llm_judge,
+            base_boundary_threshold=base_boundary_threshold,
+            boundary_weights=boundary_weights,
         )
         self._chunker = DynamicSemanticChunker(
             min_tokens=min_tokens,
@@ -256,10 +261,12 @@ def build_default_strategy_registry(
     ambiguity_margin: float = 0.08,
     create_parent_chunks: bool = True,
     max_llm_boundaries: int = 8,
+    base_boundary_threshold: float = 0.58,
+    boundary_weights: BoundaryWeights | None = None,
 ) -> ChunkStrategyRegistry:
-    """中文：构建 V0.3 通用、说明书和技术文档三种自适应结构策略。
+    """中文：构建 V4 六类内容画像的受结构约束自适应切块策略。
 
-    English: Build the V0.3 generic, manual, and technical adaptive structure strategies.
+    English: Build V4 structure-constrained adaptive strategies for six content profiles.
     """
 
     # 中文：说明书规则保护安全警告、故障块、步骤与参数组。
@@ -320,10 +327,47 @@ def build_default_strategy_registry(
         StructuralRule("config", re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]"), True),
         StructuralRule("parameter", re.compile(r"^(?:参数|返回值|错误码|默认值|类型|必填)"), True),
     )
+    # 中文：法规规则把编章节条设为硬边界，款项保留在同一条父结构下自适应组合。
+    # English: Regulation rules make parts/chapters/articles hard and merge clauses within articles.
+    regulation_rules = (
+        StructuralRule(
+            "heading",
+            re.compile(r"^第\s*[零〇一二两三四五六七八九十百千万亿0-9]+\s*[编章节]"),
+            True,
+        ),
+        StructuralRule(
+            "numbered_clause",
+            re.compile(r"^第\s*[零〇一二两三四五六七八九十百千万亿0-9]+\s*条"),
+            True,
+        ),
+        StructuralRule(
+            "sub_clause",
+            re.compile(r"^(?:第.+款|[（(][一二三四五六七八九十0-9]+[）)])"),
+        ),
+    )
+    # 中文：论文画像保护摘要、方法、实验与结论区段，同时允许同小节段落语义合并。
+    # English: Academic profile protects abstract/method/results/conclusion sections.
+    academic_rules = (
+        StructuralRule(
+            "heading",
+            re.compile(r"^(?:摘要|关键词|引言|研究方法|方法|实验|结果|讨论|结论|参考文献)$", re.I),
+            True,
+        ),
+        StructuralRule("citation_list", re.compile(r"^\[\d+]\s+"), True),
+    )
+    # 中文：叙事画像只把章节和明确场景线作为硬边界，段落之间主要依赖语义和长度。
+    # English: Narrative profile hard-splits chapters/scenes and otherwise follows semantics/length.
+    narrative_rules = (
+        StructuralRule(
+            "heading",
+            re.compile(r"^(?:第[一二三四五六七八九十百千万0-9]+章|Chapter\s+\d+)", re.I),
+        ),
+        StructuralRule("scene_break", re.compile(r"^(?:\*{3,}|-{3,}|={3,})$"), True),
+    )
     strategies: tuple[ChunkStrategy, ...] = (
         ProfileChunkStrategy(
             strategy_id="general-prose",
-            version="general-prose-v2",
+            version="general-prose-v4",
             content_profile=ContentProfile.GENERAL_PROSE,
             rules=(),
             hard_boundary_kinds=frozenset({"heading", "numbered_clause"}),
@@ -336,10 +380,12 @@ def build_default_strategy_registry(
             llm_judge=llm_judge,
             create_parent_chunks=create_parent_chunks,
             max_llm_boundaries=max_llm_boundaries,
+            base_boundary_threshold=base_boundary_threshold,
+            boundary_weights=boundary_weights,
         ),
         ProfileChunkStrategy(
             strategy_id="manual-structure",
-            version="manual-structure-v2",
+            version="manual-structure-v4",
             content_profile=ContentProfile.MANUAL,
             rules=manual_rules,
             hard_boundary_kinds=frozenset(
@@ -361,10 +407,12 @@ def build_default_strategy_registry(
             llm_judge=llm_judge,
             create_parent_chunks=create_parent_chunks,
             max_llm_boundaries=max_llm_boundaries,
+            base_boundary_threshold=base_boundary_threshold,
+            boundary_weights=boundary_weights,
         ),
         ProfileChunkStrategy(
             strategy_id="technical-document",
-            version="technical-document-v2",
+            version="technical-document-v4",
             content_profile=ContentProfile.TECHNICAL_DOC,
             rules=technical_rules,
             hard_boundary_kinds=frozenset(
@@ -386,6 +434,62 @@ def build_default_strategy_registry(
             llm_judge=llm_judge,
             create_parent_chunks=create_parent_chunks,
             max_llm_boundaries=max_llm_boundaries,
+            base_boundary_threshold=base_boundary_threshold,
+            boundary_weights=boundary_weights,
+        ),
+        ProfileChunkStrategy(
+            strategy_id="regulation-structure",
+            version="regulation-structure-v4",
+            content_profile=ContentProfile.REGULATION,
+            rules=regulation_rules,
+            hard_boundary_kinds=frozenset({"heading", "numbered_clause"}),
+            min_tokens=min_tokens,
+            target_tokens=target_tokens,
+            max_tokens=max_tokens,
+            semantic_threshold=semantic_threshold,
+            ambiguity_margin=ambiguity_margin,
+            similarity_provider=similarity_provider,
+            llm_judge=llm_judge,
+            create_parent_chunks=create_parent_chunks,
+            max_llm_boundaries=max_llm_boundaries,
+            base_boundary_threshold=base_boundary_threshold,
+            boundary_weights=boundary_weights,
+        ),
+        ProfileChunkStrategy(
+            strategy_id="academic-structure",
+            version="academic-structure-v4",
+            content_profile=ContentProfile.ACADEMIC,
+            rules=academic_rules,
+            hard_boundary_kinds=frozenset({"heading", "citation_list"}),
+            min_tokens=min_tokens,
+            target_tokens=target_tokens,
+            max_tokens=max_tokens,
+            semantic_threshold=semantic_threshold,
+            ambiguity_margin=ambiguity_margin,
+            similarity_provider=similarity_provider,
+            llm_judge=llm_judge,
+            create_parent_chunks=create_parent_chunks,
+            max_llm_boundaries=max_llm_boundaries,
+            base_boundary_threshold=base_boundary_threshold,
+            boundary_weights=boundary_weights,
+        ),
+        ProfileChunkStrategy(
+            strategy_id="narrative-structure",
+            version="narrative-structure-v4",
+            content_profile=ContentProfile.NARRATIVE,
+            rules=narrative_rules,
+            hard_boundary_kinds=frozenset({"heading", "scene_break"}),
+            min_tokens=min_tokens,
+            target_tokens=target_tokens,
+            max_tokens=max_tokens,
+            semantic_threshold=semantic_threshold,
+            ambiguity_margin=ambiguity_margin,
+            similarity_provider=similarity_provider,
+            llm_judge=llm_judge,
+            create_parent_chunks=create_parent_chunks,
+            max_llm_boundaries=max_llm_boundaries,
+            base_boundary_threshold=base_boundary_threshold,
+            boundary_weights=boundary_weights,
         ),
     )
     return ChunkStrategyRegistry(strategies)

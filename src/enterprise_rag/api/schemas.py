@@ -202,8 +202,8 @@ class SourceProfileUpdateSchema(APISchema):
     English: Define the administrator request for updating a source content profile.
     """
 
-    # 中文：V0.3 仅允许通用文本、说明书和技术文档三种受控画像。
-    # English: V0.3 accepts only generic prose, manual, and technical-document profiles.
+    # 中文：V4 允许六种受控画像，并由服务端注册表校验策略映射。
+    # English: V4 accepts six controlled profiles validated by the server-side registry.
     content_profile: ContentProfile
     # 中文：受控策略覆盖用于高级调试和灰度验证。
     # English: Controlled override supports advanced diagnostics and staged validation.

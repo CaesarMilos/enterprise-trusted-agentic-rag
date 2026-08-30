@@ -129,10 +129,12 @@ class IndexCoordinator:
                 #   publication.
                 previous_version_id = activate(plan.index_version_id)
             except Exception:
-                # 中文：变量 `raise` 用于保存“`raise`”相关数据；
-                # 其精确定义与约束见下方英文说明。
-                # English: Published but inactive snapshot remains recoverable; old ACTIVE
-                #   continues serving.
+                # 中文：数据库激活失败时精确删除本次已发布但从未 ACTIVE 的候选目录；
+                # 旧活动快照继续服务，失败元数据由服务层保留。
+                # English: Remove this published-but-never-active candidate after activation
+                # failure; the old active snapshot continues serving and metadata is retained.
+                if published.exists():
+                    shutil.rmtree(published)
                 raise
             return previous_version_id
         except Exception as exc:

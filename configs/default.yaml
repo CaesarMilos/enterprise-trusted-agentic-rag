@@ -1,4 +1,4 @@
-config_version: "1.0"
+config_version: "4.0"
 application:
   name: enterprise-trusted-agentic-rag
   environment: production
@@ -12,12 +12,18 @@ storage:
 ingestion:
   allowed_extensions: [pdf, md, txt]
   max_file_size_mb: 50
-  chunker_version: adaptive-profile-strategy-v2
+  chunker_version: structure-constrained-adaptive-v4
   min_chunk_tokens: 150
   target_chunk_tokens: 400
   max_chunk_tokens: 700
   semantic_boundary_threshold: 0.52
   semantic_ambiguity_margin: 0.08
+  boundary_structure_weight: 0.30
+  boundary_semantic_weight: 0.30
+  boundary_length_weight: 0.20
+  boundary_marker_weight: 0.10
+  boundary_role_weight: 0.10
+  adaptive_boundary_threshold: 0.58
   llm_boundary_enabled: false
   llm_boundary_max_calls: 8
   parent_chunks_enabled: true
@@ -50,6 +56,9 @@ retrieval:
   reranker_enabled: true
   reranker_model: BAAI/bge-reranker-base
   context_token_budget: 6000
+  max_parent_tokens: 1600
+  max_children_per_parent: 2
+  max_document_share: 0.6
 
 agent:
   max_retrieval_retries: 2
@@ -68,6 +77,11 @@ llm:
 security:
   default_tenant_id: demo-tenant
   enforce_access_scope: true
+  authentication_mode: trusted_proxy
   demo_auth_enabled: false
-  trusted_proxy_auth_enabled: false
+  trusted_proxy_auth_enabled: true
   trusted_proxy_secret_env: ENTERPRISE_RAG_PROXY_SECRET
+  trusted_proxy_secret_header: X-Enterprise-RAG-Proxy-Secret
+  jwt_secret_env: ENTERPRISE_RAG_JWT_SECRET
+  jwt_issuer: enterprise-rag
+  jwt_audience: enterprise-rag-api

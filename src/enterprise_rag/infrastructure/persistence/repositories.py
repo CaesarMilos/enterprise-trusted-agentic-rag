@@ -20,9 +20,16 @@ from enterprise_rag.core.enums import (
     SourceVisibility,
 )
 from enterprise_rag.core.exceptions import (
+    JobCancelledError,
     LeaseLostError,
+    LifecycleFenceError,
     StaleIndexBuildPlanError,
     error_detail,
+)
+from enterprise_rag.core.state_machine import (
+    DOCUMENT_TRANSITIONS,
+    INDEX_TRANSITIONS,
+    ensure_transition,
 )
 from enterprise_rag.domain.models import (
     Chunk,
@@ -49,6 +56,16 @@ from enterprise_rag.infrastructure.persistence.orm_models import (
 # 中文：哨兵区分“未启用乐观校验”和“期望当前没有活动索引”。
 # English: Sentinel distinguishes disabled optimistic checks from expecting no active index.
 _UNSET_ACTIVE_INDEX = object()
+
+
+def _rowcount(result: object) -> int:
+    """中文：安全读取 SQLAlchemy DML 影响行数，并兼容其抽象 Result 类型标注。
+
+    English: Safely read DML affected rows while accommodating SQLAlchemy's abstract Result type.
+    """
+
+    value = getattr(result, "rowcount", 0)
+    return value if isinstance(value, int) else 0
 
 
 class SQLAlchemyRepositories:
@@ -187,6 +204,9 @@ class SQLAlchemyRepositories:
                 title=document.title,
                 status=document.status.value,
                 active_version_id=document.active_version_id,
+                lifecycle_generation=document.lifecycle_generation,
+                delete_requested_at=document.delete_requested_at,
+                deleted_at=document.deleted_at,
                 created_at=document.created_at,
                 updated_at=document.updated_at,
             )
@@ -218,6 +238,9 @@ class SQLAlchemyRepositories:
                     "chunk_parameters": version.chunk_parameters,
                     "embedding_fingerprint": version.embedding_fingerprint,
                     "boundary_model_fingerprint": version.boundary_model_fingerprint,
+                    "profile_confidence": version.profile_confidence,
+                    "tokenizer_id": version.tokenizer_id,
+                    "extraction_pipeline_version": version.extraction_pipeline_version,
                     "quality_metrics": version.quality_metrics,
                 },
                 created_at=version.created_at,
@@ -281,26 +304,154 @@ class SQLAlchemyRepositories:
         document_id: str,
         status: DocumentStatus,
         active_version_id: str | None = None,
+        expected_generation: int | None = None,
     ) -> None:
         """中文：该函数或方法负责“设置文档状态”相关处理。
 
         English: Update document state and optionally its active immutable version.
         """
 
-        # 中文：变量 `values` 用于保存“`values`”相关数据；其精确定义与约束见下方英文说明。
-        # English: Update mapping preserves the current active version unless a new one is
-        #   supplied.
-        values: dict[str, object] = {"status": status.value, "updated_at": utc_now()}
-        if active_version_id is not None:
-            values["active_version_id"] = active_version_id
-        self._session.execute(
-            update(DocumentRow)
+        row = self._session.scalar(
+            select(DocumentRow)
             .where(
                 DocumentRow.tenant_id == tenant_id,
                 DocumentRow.id == document_id,
             )
-            .values(**values)
+            .with_for_update()
         )
+        if row is None:
+            raise LifecycleFenceError(
+                error_detail(
+                    "DOCUMENT_LIFECYCLE_FENCE_REJECTED",
+                    ErrorCategory.CONFLICT,
+                    "The document no longer exists.",
+                    document_id=document_id,
+                )
+            )
+        current_status = DocumentStatus(row.status)
+        ensure_transition(current_status, status, DOCUMENT_TRANSITIONS)
+        # 中文：变量 `values` 保存状态和可选活动版本，并与读取到的当前状态做 CAS。
+        # English: Update mapping preserves the active version and state-CASes the current row.
+        values: dict[str, object] = {"status": status.value, "updated_at": utc_now()}
+        if active_version_id is not None:
+            values["active_version_id"] = active_version_id
+        statement = update(DocumentRow).where(
+            DocumentRow.tenant_id == tenant_id,
+            DocumentRow.id == document_id,
+            DocumentRow.status == current_status.value,
+        )
+        # 中文：普通处理结果永远不能把删除中的文档恢复为 READY 或 FAILED。
+        # English: Ordinary processing results can never revive a deleting document.
+        if status not in {DocumentStatus.PENDING_DELETE, DocumentStatus.DELETED}:
+            statement = statement.where(
+                DocumentRow.status.not_in(
+                    (DocumentStatus.PENDING_DELETE.value, DocumentStatus.DELETED.value)
+                )
+            )
+        if expected_generation is not None:
+            statement = statement.where(DocumentRow.lifecycle_generation == expected_generation)
+        result = self._session.execute(statement.values(**values))
+        if _rowcount(result) != 1:
+            raise LifecycleFenceError(
+                error_detail(
+                    "DOCUMENT_LIFECYCLE_FENCE_REJECTED",
+                    ErrorCategory.CONFLICT,
+                    "The document lifecycle changed before this update could commit.",
+                    document_id=document_id,
+                )
+            )
+        self._session.flush()
+
+    def request_document_deletion(
+        self,
+        tenant_id: str,
+        document_id: str,
+        now: datetime,
+        reason: str = "document_deleted",
+    ) -> Document | None:
+        """中文：原子递增 generation、进入删除态并取消所有未完成任务。
+
+        English: Atomically increment generation, enter deletion state, and cancel unfinished jobs.
+        """
+
+        row = self._session.scalar(
+            select(DocumentRow)
+            .where(DocumentRow.tenant_id == tenant_id, DocumentRow.id == document_id)
+            .with_for_update()
+        )
+        if row is None:
+            return None
+        if row.status == DocumentStatus.DELETED.value:
+            return _document_from_row(row)
+        if row.status != DocumentStatus.PENDING_DELETE.value:
+            row.status = DocumentStatus.PENDING_DELETE.value
+            row.lifecycle_generation += 1
+            row.delete_requested_at = now
+            row.updated_at = now
+        # 中文：排队任务立即取消；运行任务设置持久标志，由 Worker 在检查点安全停止。
+        # English: Pending jobs cancel now; running workers stop at durable checkpoints.
+        self._session.execute(
+            update(IngestionJobRow)
+            .where(
+                IngestionJobRow.tenant_id == tenant_id,
+                IngestionJobRow.document_id == document_id,
+                IngestionJobRow.status == JobStatus.PENDING.value,
+            )
+            .values(
+                status=JobStatus.CANCELLED.value,
+                cancel_requested_at=now,
+                cancel_reason=reason,
+                updated_at=now,
+            )
+        )
+        self._session.execute(
+            update(IngestionJobRow)
+            .where(
+                IngestionJobRow.tenant_id == tenant_id,
+                IngestionJobRow.document_id == document_id,
+                IngestionJobRow.status == JobStatus.RUNNING.value,
+            )
+            .values(cancel_requested_at=now, cancel_reason=reason, updated_at=now)
+        )
+        self._session.flush()
+        return _document_from_row(row)
+
+    def complete_document_deletion(
+        self,
+        tenant_id: str,
+        document_id: str,
+        generation: int,
+        now: datetime,
+    ) -> None:
+        """中文：仅在相同删除 generation 下完成删除并清除活动版本引用。
+
+        English: Complete deletion and clear active version only for the same generation.
+        """
+
+        result = self._session.execute(
+            update(DocumentRow)
+            .where(
+                DocumentRow.tenant_id == tenant_id,
+                DocumentRow.id == document_id,
+                DocumentRow.status == DocumentStatus.PENDING_DELETE.value,
+                DocumentRow.lifecycle_generation == generation,
+            )
+            .values(
+                status=DocumentStatus.DELETED.value,
+                active_version_id=None,
+                deleted_at=now,
+                updated_at=now,
+            )
+        )
+        if _rowcount(result) != 1:
+            raise LifecycleFenceError(
+                error_detail(
+                    "DOCUMENT_DELETE_FENCE_REJECTED",
+                    ErrorCategory.CONFLICT,
+                    "The deletion generation no longer matches the document.",
+                    document_id=document_id,
+                )
+            )
         self._session.flush()
 
     def list_active_versions(self, tenant_id: str) -> Sequence[DocumentVersion]:
@@ -490,12 +641,15 @@ class SQLAlchemyRepositories:
                 tenant_id=job.tenant_id,
                 document_id=job.document_id,
                 document_version_id=job.document_version_id,
+                document_generation_snapshot=job.document_generation_snapshot,
                 status=job.status.value,
                 attempt_count=job.attempt_count,
                 lease_owner=job.lease_owner,
                 lease_expires_at=job.lease_expires_at,
                 error_code=job.error_code,
                 error_message=job.error_message,
+                cancel_requested_at=job.cancel_requested_at,
+                cancel_reason=job.cancel_reason,
                 created_at=job.created_at,
                 updated_at=job.updated_at,
             )
@@ -533,6 +687,7 @@ class SQLAlchemyRepositories:
         candidate_id = self._session.scalar(
             select(IngestionJobRow.id)
             .where(
+                IngestionJobRow.cancel_requested_at.is_(None),
                 or_(
                     IngestionJobRow.status == JobStatus.PENDING.value,
                     (
@@ -550,6 +705,7 @@ class SQLAlchemyRepositories:
             update(IngestionJobRow)
             .where(
                 IngestionJobRow.id == candidate_id,
+                IngestionJobRow.cancel_requested_at.is_(None),
                 or_(
                     IngestionJobRow.status == JobStatus.PENDING.value,
                     (
@@ -566,7 +722,7 @@ class SQLAlchemyRepositories:
                 updated_at=now,
             )
         )
-        if claim_result.rowcount != 1:
+        if _rowcount(claim_result) != 1:
             return None
         self._session.flush()
         candidate = self._session.scalar(
@@ -599,11 +755,23 @@ class SQLAlchemyRepositories:
                 IngestionJobRow.attempt_count == fence.attempt_count,
                 IngestionJobRow.lease_expires_at.is_not(None),
                 IngestionJobRow.lease_expires_at > now,
+                IngestionJobRow.cancel_requested_at.is_(None),
+                IngestionJobRow.document_generation_snapshot == fence.document_generation,
+                IngestionJobRow.document_id.in_(
+                    select(DocumentRow.id).where(
+                        DocumentRow.tenant_id == fence.tenant_id,
+                        DocumentRow.id == fence.document_id,
+                        DocumentRow.lifecycle_generation == fence.document_generation,
+                        DocumentRow.status.not_in(
+                            (DocumentStatus.PENDING_DELETE.value, DocumentStatus.DELETED.value)
+                        ),
+                    )
+                ),
             )
             .values(lease_expires_at=lease_until, updated_at=now)
         )
         self._session.flush()
-        return result.rowcount == 1
+        return _rowcount(result) == 1
 
     def assert_job_fence(self, fence: JobFence, now: datetime) -> None:
         """中文：在副作用事务内锁定并验证当前 Worker 的有效租约代次。
@@ -622,19 +790,74 @@ class SQLAlchemyRepositories:
                 IngestionJobRow.attempt_count == fence.attempt_count,
                 IngestionJobRow.lease_expires_at.is_not(None),
                 IngestionJobRow.lease_expires_at > now,
+                IngestionJobRow.cancel_requested_at.is_(None),
+                IngestionJobRow.document_generation_snapshot == fence.document_generation,
+                IngestionJobRow.document_id.in_(
+                    select(DocumentRow.id).where(
+                        DocumentRow.tenant_id == fence.tenant_id,
+                        DocumentRow.id == fence.document_id,
+                        DocumentRow.lifecycle_generation == fence.document_generation,
+                        DocumentRow.status.not_in(
+                            (DocumentStatus.PENDING_DELETE.value, DocumentStatus.DELETED.value)
+                        ),
+                    )
+                ),
             )
             .values(updated_at=now)
         )
-        if result.rowcount != 1:
-            raise LeaseLostError(
+        if _rowcount(result) != 1:
+            self._raise_fence_failure(fence)
+        self._session.flush()
+
+    def _raise_fence_failure(self, fence: JobFence) -> None:
+        """中文：区分取消、文档代次失效和普通租约丢失，驱动正确的 Worker 收口。
+
+        English: Distinguish cancellation, lifecycle staleness, and ordinary lease loss.
+        """
+
+        job = self._session.scalar(
+            select(IngestionJobRow).where(
+                IngestionJobRow.tenant_id == fence.tenant_id,
+                IngestionJobRow.id == fence.job_id,
+            )
+        )
+        if job is not None and job.cancel_requested_at is not None:
+            raise JobCancelledError(
                 error_detail(
-                    "INGESTION_LEASE_LOST",
+                    "INGESTION_CANCELLED",
                     ErrorCategory.CONFLICT,
-                    "The ingestion worker no longer owns this job attempt.",
+                    "The ingestion job was cancelled before publication.",
                     job_id=fence.job_id,
                 )
             )
-        self._session.flush()
+        document = self._session.scalar(
+            select(DocumentRow).where(
+                DocumentRow.tenant_id == fence.tenant_id,
+                DocumentRow.id == fence.document_id,
+            )
+        )
+        if (
+            document is None
+            or document.lifecycle_generation != fence.document_generation
+            or document.status
+            in {DocumentStatus.PENDING_DELETE.value, DocumentStatus.DELETED.value}
+        ):
+            raise LifecycleFenceError(
+                error_detail(
+                    "DOCUMENT_LIFECYCLE_FENCE_REJECTED",
+                    ErrorCategory.CONFLICT,
+                    "The document lifecycle invalidated this ingestion attempt.",
+                    document_id=fence.document_id,
+                )
+            )
+        raise LeaseLostError(
+            error_detail(
+                "INGESTION_LEASE_LOST",
+                ErrorCategory.CONFLICT,
+                "The ingestion worker no longer owns this job attempt.",
+                job_id=fence.job_id,
+            )
+        )
 
     def replace_version_chunks_fenced(
         self,
@@ -706,6 +929,34 @@ class SQLAlchemyRepositories:
             error_message=error_message,
         )
 
+    def mark_job_cancelled(self, fence: JobFence, now: datetime, reason: str) -> None:
+        """中文：把当前运行代次收口为 CANCELLED，且不覆盖文档删除状态。
+
+        English: Terminally cancel the current attempt without overwriting document deletion.
+        """
+
+        result = self._session.execute(
+            update(IngestionJobRow)
+            .where(
+                IngestionJobRow.tenant_id == fence.tenant_id,
+                IngestionJobRow.id == fence.job_id,
+                IngestionJobRow.status == JobStatus.RUNNING.value,
+                IngestionJobRow.lease_owner == fence.lease_owner,
+                IngestionJobRow.attempt_count == fence.attempt_count,
+            )
+            .values(
+                status=JobStatus.CANCELLED.value,
+                lease_owner=None,
+                lease_expires_at=None,
+                cancel_requested_at=now,
+                cancel_reason=reason,
+                updated_at=now,
+            )
+        )
+        if _rowcount(result) != 1:
+            self._raise_fence_failure(fence)
+        self._session.flush()
+
     def mark_job_attention_required(
         self,
         fence: JobFence,
@@ -766,7 +1017,7 @@ class SQLAlchemyRepositories:
                 updated_at=now,
             )
         )
-        if result.rowcount != 1:
+        if _rowcount(result) != 1:
             raise LeaseLostError(
                 error_detail(
                     "INGESTION_LEASE_LOST",
@@ -793,6 +1044,9 @@ class SQLAlchemyRepositories:
                 config_fingerprint=index.config_fingerprint,
                 created_at=index.created_at,
                 activated_at=index.activated_at,
+                error_code=index.error_code,
+                error_message=index.error_message,
+                completed_at=index.completed_at,
             )
         )
         self._session.flush()
@@ -816,20 +1070,52 @@ class SQLAlchemyRepositories:
         tenant_id: str,
         index_version_id: str,
         status: IndexStatus,
+        error_code: str | None = None,
+        error_message: str | None = None,
     ) -> None:
         """中文：该函数或方法负责“设置索引状态”相关处理。
 
         English: Update one tenant-owned index publication state.
         """
 
-        self._session.execute(
-            update(IndexVersionRow)
+        row = self._session.scalar(
+            select(IndexVersionRow)
             .where(
                 IndexVersionRow.tenant_id == tenant_id,
                 IndexVersionRow.id == index_version_id,
             )
-            .values(status=status.value)
+            .with_for_update()
         )
+        if row is None:
+            raise ValueError("the tenant-owned index version does not exist")
+        current_status = IndexStatus(row.status)
+        ensure_transition(current_status, status, INDEX_TRANSITIONS)
+        result = self._session.execute(
+            update(IndexVersionRow)
+            .where(
+                IndexVersionRow.tenant_id == tenant_id,
+                IndexVersionRow.id == index_version_id,
+                IndexVersionRow.status == current_status.value,
+            )
+            .values(
+                status=status.value,
+                error_code=error_code,
+                error_message=error_message,
+                completed_at=(
+                    utc_now()
+                    if status
+                    in {
+                        IndexStatus.ACTIVE,
+                        IndexStatus.FAILED,
+                        IndexStatus.CANCELLED,
+                        IndexStatus.PURGED,
+                    }
+                    else None
+                ),
+            )
+        )
+        if _rowcount(result) != 1:
+            raise ValueError("the index state changed before this transition committed")
         self._session.flush()
 
     def activate_index(
@@ -852,7 +1138,7 @@ class SQLAlchemyRepositories:
             .where(TenantRow.id == tenant_id)
             .values(name=TenantRow.name)
         )
-        if tenant_lock.rowcount != 1:
+        if _rowcount(tenant_lock) != 1:
             raise ValueError("the index tenant does not exist")
         # 中文：关键变量 `current` 在锁定后读取，用于执行真实的乐观并发校验。
         # English: Key variable `current` is read after locking and drives the real
@@ -894,6 +1180,7 @@ class SQLAlchemyRepositories:
             current.status = IndexStatus.RETIRED.value
         target.status = IndexStatus.ACTIVE.value
         target.activated_at = utc_now()
+        target.completed_at = target.activated_at
         self._session.flush()
         return current_id
 
@@ -1004,6 +1291,9 @@ def _document_from_row(row: DocumentRow) -> Document:
         title=row.title,
         status=DocumentStatus(row.status),
         active_version_id=row.active_version_id,
+        lifecycle_generation=row.lifecycle_generation,
+        delete_requested_at=row.delete_requested_at,
+        deleted_at=row.deleted_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -1015,8 +1305,8 @@ def _version_from_row(row: DocumentVersionRow) -> DocumentVersion:
     English: Map a persistence version row to an immutable domain entity.
     """
 
-    # 中文：旧数据的空快照使用兼容默认值，后续重处理将生成完整新快照。
-    # English: Empty legacy snapshots use compatible defaults; reprocessing creates full data.
+    # 中文：历史数据的空快照使用兼容默认值，后续重处理将生成完整新快照。
+    # English: Empty historical snapshots use safe defaults; reprocessing creates full data.
     snapshot = _json_mapping(row.ingestion_snapshot)
     raw_profile = str(snapshot.get("content_profile", ContentProfile.GENERAL_PROSE.value))
     return DocumentVersion(
@@ -1041,6 +1331,11 @@ def _version_from_row(row: DocumentVersionRow) -> DocumentVersion:
             str(snapshot["boundary_model_fingerprint"])
             if snapshot.get("boundary_model_fingerprint")
             else None
+        ),
+        profile_confidence=_safe_float(snapshot.get("profile_confidence"), 1.0),
+        tokenizer_id=str(snapshot.get("tokenizer_id", "unicode-codepoint-v1")),
+        extraction_pipeline_version=str(
+            snapshot.get("extraction_pipeline_version", "extraction-v4")
         ),
         quality_metrics=_json_mapping(snapshot.get("quality_metrics")),
         created_at=row.created_at,
@@ -1094,8 +1389,8 @@ def _chunk_from_row(row: ChunkRow) -> Chunk:
     English: Map a persistence chunk row to an immutable domain entity.
     """
 
-    # 中文：旧 V0.2 数据缺少新增键时使用安全默认值，无需破坏性迁移。
-    # English: Safe defaults keep V0.2 rows readable without a destructive migration.
+    # 中文：V4 之前的数据缺少新增键时使用安全默认值，无需破坏性迁移。
+    # English: Safe defaults keep pre-V4 rows readable without a destructive migration.
     metadata = _json_mapping(row.extra_metadata)
     return Chunk(
         id=row.id,
@@ -1145,7 +1440,7 @@ def _json_mapping(value: object) -> dict[str, object]:
 def _safe_int(value: object, default: int) -> int:
     """中文：解析持久化整数，并在旧数据类型异常时返回默认值。
 
-    English: Parse a persisted integer and return the default for malformed legacy values.
+    English: Parse a persisted integer and default malformed historical values.
     """
 
     if isinstance(value, (int, float, str)):
@@ -1159,7 +1454,7 @@ def _safe_int(value: object, default: int) -> int:
 def _safe_float(value: object, default: float) -> float:
     """中文：解析持久化浮点数，并在旧数据类型异常时返回默认值。
 
-    English: Parse a persisted float and return the default for malformed legacy values.
+    English: Parse a persisted float and default malformed historical values.
     """
 
     if isinstance(value, (int, float, str)):
@@ -1181,12 +1476,15 @@ def _job_from_row(row: IngestionJobRow) -> IngestionJob:
         tenant_id=row.tenant_id,
         document_id=row.document_id,
         document_version_id=row.document_version_id,
+        document_generation_snapshot=row.document_generation_snapshot,
         status=JobStatus(row.status),
         attempt_count=row.attempt_count,
         lease_owner=row.lease_owner,
         lease_expires_at=row.lease_expires_at,
         error_code=row.error_code,
         error_message=row.error_message,
+        cancel_requested_at=row.cancel_requested_at,
+        cancel_reason=row.cancel_reason,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -1207,6 +1505,9 @@ def _index_from_row(row: IndexVersionRow) -> IndexVersion:
         config_fingerprint=row.config_fingerprint,
         created_at=row.created_at,
         activated_at=row.activated_at,
+        error_code=row.error_code,
+        error_message=row.error_message,
+        completed_at=row.completed_at,
     )
 
 

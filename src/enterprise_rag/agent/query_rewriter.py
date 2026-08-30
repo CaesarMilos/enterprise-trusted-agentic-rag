@@ -6,6 +6,7 @@ English: Rewrite a query from a concrete evidence gap while preventing retry loo
 from __future__ import annotations
 
 from enterprise_rag.agent.evidence_grader import EvidenceGrade
+from enterprise_rag.agent.model_invocation import complete_with_timeout
 from enterprise_rag.agent.prompts import REWRITE_SYSTEM_PROMPT
 from enterprise_rag.domain.protocols.models import LLMProvider, ModelResponse
 from enterprise_rag.retrieval.identifier_normalizer import extract_exact_anchors
@@ -33,6 +34,7 @@ class QueryRewriter:
         current_query: str,
         grade: EvidenceGrade,
         history: tuple[str, ...],
+        timeout_seconds: float | None = None,
     ) -> tuple[str, ModelResponse]:
         """中文：该函数或方法负责“改写”相关处理。
 
@@ -50,10 +52,12 @@ class QueryRewriter:
             "Preserve every clause, chapter, step, error-code, and model identifier exactly.\n"
             "Return a better search query."
         )
-        response = self._provider.complete(
+        response = complete_with_timeout(
+            self._provider,
             REWRITE_SYSTEM_PROMPT,
             user_prompt,
-            metadata={"operation": "query_rewrite"},
+            {"operation": "query_rewrite"},
+            timeout_seconds,
         )
         # 中文：变量 `rewritten` 用于保存“`rewritten`”相关数据；
         # 其精确定义与约束见下方英文说明。

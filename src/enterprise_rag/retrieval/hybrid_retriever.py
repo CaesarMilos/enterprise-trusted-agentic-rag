@@ -18,6 +18,7 @@ from enterprise_rag.retrieval.dense_retriever import DenseRetriever
 from enterprise_rag.retrieval.dynamic_top_k import DynamicTopK
 from enterprise_rag.retrieval.fusion import ReciprocalRankFusion
 from enterprise_rag.retrieval.models import EvidenceBundle, RetrievalCandidate, RetrievalQuery
+from enterprise_rag.retrieval.parent_expander import ParentExpander
 from enterprise_rag.retrieval.query_normalizer import QueryNormalizer
 from enterprise_rag.retrieval.reranker import CandidateReranker
 from enterprise_rag.retrieval.source_profile_catalog import SourceProfileCatalog
@@ -42,6 +43,7 @@ class HybridRetriever:
         top_k: DynamicTopK,
         context_builder: ContextBuilder,
         chunk_loader: Callable[[str, Sequence[str]], Sequence[Chunk]],
+        parent_expander: ParentExpander | None = None,
     ) -> None:
         """中文：初始化当前实例，并保存后续操作所需的依赖、配置或状态。
 
@@ -83,6 +85,9 @@ class HybridRetriever:
         # 其精确定义与约束见下方英文说明。
         # English: Tenant-scoped repository callback loading complete chunk entities.
         self._chunk_loader = chunk_loader
+        # 中文：可选扩展器在 Child 选择完成后补齐 Parent，不影响索引候选排序。
+        # English: Optional expander adds parents after child selection without changing ranking.
+        self._parent_expander = parent_expander
 
     def retrieve(
         self,
@@ -165,6 +170,20 @@ class HybridRetriever:
         if reranker_degraded:
             degradations.append("reranker_unavailable")
         selected, top_k = self._top_k.select(reranked, chunks)
+        expanded_contexts: dict[str, Chunk] = {}
+        if self._parent_expander is not None:
+            expansion = self._parent_expander.expand(
+                scope.tenant_id,
+                selected,
+                chunks,
+                self._chunk_loader,
+            )
+            expanded_contexts.update(expansion.contexts)
+            top_k = replace(
+                top_k,
+                expanded_parent_chunk_ids=expansion.expanded_parent_ids,
+                final_context_tokens=expansion.token_count,
+            )
         if scope.index_version_id is None:
             raise ValueError("hybrid retrieval requires a pinned index version")
         return self._context_builder.build(
@@ -174,6 +193,7 @@ class HybridRetriever:
             routing=routing,
             top_k=top_k,
             degradations=tuple(degradations),
+            expanded_contexts=expanded_contexts,
         )
 
 

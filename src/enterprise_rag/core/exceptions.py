@@ -84,6 +84,20 @@ class LeaseLostError(ConflictError):
     """
 
 
+class LifecycleFenceError(ConflictError):
+    """中文：报告任务持有的文档 generation 已失效，禁止任何后续写入或发布。
+
+    English: Report that a job's document generation is stale and may no longer write or publish.
+    """
+
+
+class JobCancelledError(ConflictError):
+    """中文：报告任务收到持久取消请求并在安全检查点停止。
+
+    English: Report that a job observed a durable cancellation request at a safe checkpoint.
+    """
+
+
 class StaleIndexBuildPlanError(ConflictError):
     """中文：报告索引计划基于已经过期的活动索引快照。
 
@@ -102,6 +116,20 @@ class ParsingError(EnterpriseRAGError):
     """中文：该类用于表示或实现“解析错误（ParsingError）”的职责。
 
     English: Report a document parsing failure.
+    """
+
+
+class ChunkValidationError(ParsingError):
+    """中文：报告切块集合违反硬边界、完整性或父子关系发布门禁。
+
+    English: Report that chunks violate hard-boundary, integrity, or hierarchy publication gates.
+    """
+
+
+class AuthenticationConfigurationError(ValidationError):
+    """中文：报告认证模式、密钥或身份提供方配置不满足安全启动条件。
+
+    English: Report authentication settings that fail secure-start requirements.
     """
 
 

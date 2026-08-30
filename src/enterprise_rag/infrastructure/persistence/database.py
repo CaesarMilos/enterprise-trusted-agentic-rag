@@ -5,6 +5,8 @@ English: Create SQLAlchemy engines, sessions, schema, and explicit transaction b
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -19,6 +21,14 @@ def create_database_engine(database_url: str, echo: bool = False) -> Engine:
 
     English: Create an engine with SQLite foreign keys and production-safe connection checks.
     """
+
+    # 中文：全新本地部署首次启动时，SQLite 不会自动创建数据库父目录，
+    # 因此必须在建立数据库连接前创建目录。
+    # English: SQLite cannot create a missing parent directory, so bootstrap it
+    # before opening the database during a fresh local deployment.
+    if database_url.startswith("sqlite:///") and ":memory:" not in database_url:
+        database_path = Path(database_url.removeprefix("sqlite:///")).expanduser()
+        database_path.resolve().parent.mkdir(parents=True, exist_ok=True)
 
     # 中文：变量 `connect_args` 用于保存“`connect``args`”相关数据；
     # 其精确定义与约束见下方英文说明。
@@ -70,12 +80,13 @@ def initialize_database(engine: Engine) -> None:
     Base.metadata.create_all(engine)
     _migrate_source_content_profile_columns(engine)
     _migrate_document_version_snapshot_column(engine)
+    _migrate_v4_lifecycle_columns(engine)
 
 
 def _migrate_source_content_profile_columns(engine: Engine) -> None:
-    """中文：为旧数据库补充 V0.2 内容画像列并保留全部已有资料源。
+    """中文：为 V4 之前的数据库补充内容画像列并保留全部已有资料源。
 
-    English: Add V0.2 source-profile columns to legacy databases without deleting data.
+    English: Add source-profile columns to pre-V4 databases without deleting existing data.
     """
 
     # 中文：变量 `existing_columns` 保存当前 sources 表的真实列名，迁移因此可重复执行。
@@ -96,9 +107,9 @@ def _migrate_source_content_profile_columns(engine: Engine) -> None:
 
 
 def _migrate_document_version_snapshot_column(engine: Engine) -> None:
-    """中文：为旧数据库补充 V0.3 接入策略快照 JSON 列。
+    """中文：为 V4 之前的数据库补充接入策略快照 JSON 列。
 
-    English: Add the V0.3 ingestion-strategy snapshot JSON column to legacy databases.
+    English: Add the ingestion-strategy snapshot JSON column to pre-V4 databases.
     """
 
     existing_columns = {
@@ -113,6 +124,57 @@ def _migrate_document_version_snapshot_column(engine: Engine) -> None:
                 "NOT NULL DEFAULT '{}'"
             )
         )
+
+
+def _migrate_v4_lifecycle_columns(engine: Engine) -> None:
+    """中文：幂等补充 V4 文档 fencing、任务取消与索引终态字段。
+
+    English: Idempotently add V4 document fencing, job cancellation, and index terminal fields.
+
+    中文：本发行版以 SQLite 为持久化基线；其他数据库适配器必须提供版本化迁移。
+    English: SQLite is this distribution's baseline; other database adapters need migrations.
+    """
+
+    # 中文：每张表独立检查列集合，重复启动不会再次执行 ALTER TABLE。
+    # English: Each table is inspected independently so repeated startup never repeats ALTERs.
+    table_columns = {
+        table: {column["name"] for column in inspect(engine).get_columns(table)}
+        for table in ("documents", "ingestion_jobs", "index_versions")
+    }
+    statements = {
+        "documents": {
+            "lifecycle_generation": (
+                "ALTER TABLE documents ADD COLUMN lifecycle_generation INTEGER "
+                "NOT NULL DEFAULT 0"
+            ),
+            "delete_requested_at": (
+                "ALTER TABLE documents ADD COLUMN delete_requested_at DATETIME"
+            ),
+            "deleted_at": "ALTER TABLE documents ADD COLUMN deleted_at DATETIME",
+        },
+        "ingestion_jobs": {
+            "document_generation_snapshot": (
+                "ALTER TABLE ingestion_jobs ADD COLUMN document_generation_snapshot INTEGER "
+                "NOT NULL DEFAULT 0"
+            ),
+            "cancel_requested_at": (
+                "ALTER TABLE ingestion_jobs ADD COLUMN cancel_requested_at DATETIME"
+            ),
+            "cancel_reason": (
+                "ALTER TABLE ingestion_jobs ADD COLUMN cancel_reason VARCHAR(128)"
+            ),
+        },
+        "index_versions": {
+            "error_code": "ALTER TABLE index_versions ADD COLUMN error_code VARCHAR(128)",
+            "error_message": "ALTER TABLE index_versions ADD COLUMN error_message TEXT",
+            "completed_at": "ALTER TABLE index_versions ADD COLUMN completed_at DATETIME",
+        },
+    }
+    with engine.begin() as connection:
+        for table, columns in statements.items():
+            for column, statement in columns.items():
+                if column not in table_columns[table]:
+                    connection.execute(text(statement))
 
 
 @contextmanager

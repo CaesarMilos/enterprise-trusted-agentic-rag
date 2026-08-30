@@ -10,10 +10,16 @@ import json
 import math
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Protocol
 
 from enterprise_rag.domain.protocols.models import EmbeddingProvider, LLMProvider
+from enterprise_rag.ingestion.chunking.boundary_scorer import (
+    AdaptiveBoundaryScorer,
+    BoundaryFeatures,
+    BoundaryWeights,
+)
 from enterprise_rag.ingestion.structure_parser import StructuredUnit
 
 # 中文：中文单字和拉丁词项构成无外部模型时的确定性语义回退向量。
@@ -50,6 +56,13 @@ class BoundaryDecision:
     # 中文：`llm_calls_used` 保存当前文档截至本次判定消耗的真实调用次数。
     # English: `llm_calls_used` stores real document-level calls consumed by this decision.
     llm_calls_used: int = 0
+    # 中文：`score` 和 `threshold` 记录 V4 加权公式及动态门槛。
+    # English: `score` and `threshold` record the V4 weighted formula and dynamic cutoff.
+    score: float | None = None
+    threshold: float | None = None
+    # 中文：标准化特征映射让 Trace 可以解释为什么在该位置切分。
+    # English: Normalized feature mapping lets traces explain why the boundary was selected.
+    features: dict[str, float] | None = None
 
 
 @dataclass(slots=True)
@@ -127,6 +140,23 @@ class EmbeddingSimilarity:
         # 中文：关键变量 `_provider` 负责批量生成左右文本向量。
         # English: Key variable `_provider` embeds the left and right passages in one batch.
         self._provider = provider
+        # 中文：文档级向量缓存由 prepare 批量填充，边界循环只进行内存余弦计算。
+        # English: Document cache is batch-filled by prepare; boundary loops use in-memory cosine.
+        self._cache: dict[str, Sequence[float]] = {}
+
+    def prepare(self, texts: Sequence[str]) -> None:
+        """中文：对去重后的未缓存单元一次批量 Embedding，消除逐边界网络调用。
+
+        English: Batch-embed unique uncached units once, eliminating per-boundary provider calls.
+        """
+
+        missing = tuple(dict.fromkeys(text for text in texts if text and text not in self._cache))
+        if not missing:
+            return
+        vectors = self._provider.embed(missing)
+        if len(vectors) != len(missing):
+            raise ValueError("embedding provider returned an unexpected vector count")
+        self._cache.update(zip(missing, vectors, strict=True))
 
     def similarity(self, left: str, right: str) -> float:
         """中文：计算左右文本向量的安全余弦相似度。
@@ -134,10 +164,30 @@ class EmbeddingSimilarity:
         English: Compute a numerically safe cosine similarity for the two passages.
         """
 
-        vectors = self._provider.embed((left, right))
-        if len(vectors) != 2:
+        self.prepare((left, right))
+        return _vector_cosine(self._cache[left], self._cache[right])
+
+    def semantic_continuity(self, left_texts: Sequence[str], right: str) -> float:
+        """中文：融合最后单元相似度与缓冲区向量质心相似度，降低局部噪声误切。
+
+        English: Blend last-unit and buffer-centroid similarity to reduce noisy local splits.
+        """
+
+        usable_left = tuple(text for text in left_texts if text)
+        if not usable_left or not right:
             return 0.0
-        return _vector_cosine(vectors[0], vectors[1])
+        self.prepare(usable_left + (right,))
+        right_vector = self._cache[right]
+        last_similarity = _vector_cosine(self._cache[usable_left[-1]], right_vector)
+        dimension = len(right_vector)
+        if dimension == 0:
+            return last_similarity
+        centroid = tuple(
+            sum(self._cache[text][index] for text in usable_left) / len(usable_left)
+            for index in range(dimension)
+        )
+        centroid_similarity = _vector_cosine(centroid, right_vector)
+        return 0.65 * last_similarity + 0.35 * centroid_similarity
 
 
 class LLMBoundaryJudge:
@@ -220,6 +270,8 @@ class AdaptiveBoundaryAnalyzer:
         ambiguity_margin: float = 0.08,
         similarity_provider: SimilarityProvider | None = None,
         llm_judge: LLMBoundaryJudge | None = None,
+        base_boundary_threshold: float = 0.58,
+        boundary_weights: BoundaryWeights | None = None,
     ) -> None:
         """中文：校验预算并保存自适应边界判定依赖。
 
@@ -236,6 +288,25 @@ class AdaptiveBoundaryAnalyzer:
         self._ambiguity_margin = ambiguity_margin
         self._similarity = similarity_provider
         self._llm_judge = llm_judge
+        # 中文：评分器实现 B=wsS+weG+wlL+wmM+wrR 与长度自适应阈值。
+        # English: Scorer implements B=wsS+weG+wlL+wmM+wrR with a length-adaptive threshold.
+        self._scorer = AdaptiveBoundaryScorer(
+            min_tokens=min_tokens,
+            target_tokens=target_tokens,
+            max_tokens=max_tokens,
+            base_threshold=base_boundary_threshold,
+            weights=boundary_weights,
+        )
+
+    def prepare(self, units: Sequence[StructuredUnit]) -> None:
+        """中文：在边界循环前批量准备语义向量；不支持预取的回退实现无需处理。
+
+        English: Batch-prepare semantic vectors before boundary iteration when supported.
+        """
+
+        prepare = getattr(self._similarity, "prepare", None)
+        if callable(prepare):
+            prepare(tuple(unit.retrieval_text or unit.text for unit in units))
 
     def decide(
         self,
@@ -267,15 +338,11 @@ class AdaptiveBoundaryAnalyzer:
             return BoundaryDecision(True, "structural_boundary", 1.0)
         if right.heading_path != buffer[-1].heading_path:
             return BoundaryDecision(True, "heading_change", 1.0)
-        if buffer_tokens < self._min_tokens:
-            return BoundaryDecision(False, "below_min_tokens", 1.0)
-        if buffer_tokens < self._target_tokens:
-            return BoundaryDecision(False, "below_target_tokens", 0.9)
-
         # 中文：检索文本包含标题和编号，比只看正文更适合识别说明书/法典边界。
         # English: Retrieval text includes headings and identifiers, improving manual/legal
         # boundary signals.
-        left_text = buffer[-1].retrieval_text or buffer[-1].text
+        left_texts = tuple(unit.retrieval_text or unit.text for unit in buffer)
+        left_text = left_texts[-1]
         right_text = right.retrieval_text or right.text
         # 中文：关键变量 `similarity_fallback` 记录向量提供方异常后的词频降级。
         # English: Key variable `similarity_fallback` records lexical degradation after a
@@ -285,7 +352,12 @@ class AdaptiveBoundaryAnalyzer:
             similarity = _lexical_cosine(left_text, right_text)
         else:
             try:
-                similarity = self._similarity.similarity(left_text, right_text)
+                semantic_continuity = getattr(self._similarity, "semantic_continuity", None)
+                similarity = (
+                    semantic_continuity(left_texts, right_text)
+                    if callable(semantic_continuity)
+                    else self._similarity.similarity(left_text, right_text)
+                )
                 if not math.isfinite(similarity):
                     raise ValueError("similarity provider returned a non-finite value")
                 similarity = max(-1.0, min(1.0, similarity))
@@ -295,23 +367,37 @@ class AdaptiveBoundaryAnalyzer:
                 # has no provider dependency.
                 similarity = _lexical_cosine(left_text, right_text)
                 similarity_fallback = "embedding_provider_error"
-        lower = self._semantic_threshold - self._ambiguity_margin
-        upper = self._semantic_threshold + self._ambiguity_margin
-        if similarity <= lower:
+        semantic_gap = max(0.0, min(1.0, (1.0 - similarity) / 2.0))
+        last = buffer[-1]
+        features = BoundaryFeatures(
+            structural_strength=_structural_strength(last, right),
+            semantic_gap=semantic_gap,
+            length_pressure=self._scorer.length_pressure(buffer_tokens),
+            marker_change=_marker_change(last, right),
+            role_change=_role_change(last, right),
+        )
+        scored = self._scorer.score(features, buffer_tokens)
+        feature_map = {
+            "structure": scored.features.structural_strength,
+            "semantic_gap": scored.features.semantic_gap,
+            "length_pressure": scored.features.length_pressure,
+            "marker_change": scored.features.marker_change,
+            "role_change": scored.features.role_change,
+        }
+        # 中文：只有加权总分靠近动态门槛时才允许消耗 LLM 预算。
+        # English: Only scores near the dynamic cutoff may consume the optional LLM budget.
+        ambiguous = abs(scored.score - scored.threshold) <= self._ambiguity_margin
+        if not ambiguous:
+            confidence = min(1.0, 0.5 + abs(scored.score - scored.threshold))
             return BoundaryDecision(
-                True,
-                "lexical_fallback_gap" if similarity_fallback else "semantic_gap",
-                1.0 - max(0.0, similarity),
+                scored.should_split,
+                "adaptive_score_split" if scored.should_split else "adaptive_score_merge",
+                confidence,
                 similarity,
                 fallback_reason=similarity_fallback,
-            )
-        if similarity >= upper:
-            return BoundaryDecision(
-                False,
-                "lexical_fallback_continuity" if similarity_fallback else "semantic_continuity",
-                similarity,
-                similarity,
-                fallback_reason=similarity_fallback,
+                score=scored.score,
+                threshold=scored.threshold,
+                features=feature_map,
             )
         llm_fallback_reason: str | None = similarity_fallback
         llm_attempted = False
@@ -332,20 +418,25 @@ class AdaptiveBoundaryAnalyzer:
                         llm_attempted=True,
                         fallback_reason=similarity_fallback,
                         llm_calls_used=review_budget.used_calls,
+                        score=scored.score,
+                        threshold=scored.threshold,
+                        features=feature_map,
                     )
                 if llm_fallback_reason != "llm_provider_error":
                     llm_fallback_reason = "llm_invalid_json"
             else:
                 llm_fallback_reason = "llm_budget_exhausted"
-        # 中文：模糊区回退到目标长度压力，确保关闭 LLM 时结果仍可复现。
-        # English: The ambiguous band falls back to size pressure for reproducibility without
-        # an LLM.
-        should_split = buffer_tokens >= int(self._target_tokens * 1.2)
-        fallback_method = {
+        # 中文：模糊区严格回退加权评分结果，确保关闭或失去 LLM 时结果仍可复现。
+        # English: The ambiguous band falls back to the weighted score for reproducibility.
+        should_split = scored.should_split
+        fallback_methods: dict[str | None, str] = {
             "llm_provider_error": "llm_provider_error_fallback",
             "llm_invalid_json": "llm_invalid_json_fallback",
             "llm_budget_exhausted": "llm_budget_exhausted",
-        }.get(llm_fallback_reason, "size_pressure")
+        }
+        fallback_method = fallback_methods.get(
+            llm_fallback_reason, "adaptive_score_ambiguous"
+        )
         return BoundaryDecision(
             should_split,
             fallback_method,
@@ -354,7 +445,54 @@ class AdaptiveBoundaryAnalyzer:
             llm_attempted=llm_attempted,
             fallback_reason=llm_fallback_reason,
             llm_calls_used=review_budget.used_calls if review_budget is not None else 0,
+            score=scored.score,
+            threshold=scored.threshold,
+            features=feature_map,
         )
+
+
+def _structural_strength(left: StructuredUnit, right: StructuredUnit) -> float:
+    """中文：量化非硬结构变化；真正硬边界已在评分前直接切分。
+
+    English: Quantify soft structural change; true hard boundaries already split before scoring.
+    """
+
+    if left.kind == right.kind:
+        return 0.05
+    if {left.kind, right.kind} <= {"prose", "sub_clause", "paragraph"}:
+        return 0.20
+    return 0.60
+
+
+def _marker_change(left: StructuredUnit, right: StructuredUnit) -> float:
+    """中文：根据编号、标题路径和页码变化计算主题标记强度。
+
+    English: Measure topic-marker change from numbering, heading paths, and page transitions.
+    """
+
+    if left.section_number and right.section_number and left.section_number != right.section_number:
+        return 1.0
+    if right.section_number and right.section_number != left.section_number:
+        return 0.80
+    if left.heading_path != right.heading_path:
+        return 0.90
+    if left.page_number and right.page_number and left.page_number != right.page_number:
+        return 0.20
+    return 0.0
+
+
+def _role_change(left: StructuredUnit, right: StructuredUnit) -> float:
+    """中文：识别正文、步骤、警告、表格、代码等语义角色切换。
+
+    English: Detect semantic-role switches among prose, steps, warnings, tables, and code.
+    """
+
+    protected_roles = {"warning", "step", "table", "code", "api_section", "parameter"}
+    if left.kind == right.kind:
+        return 0.0
+    if left.kind in protected_roles or right.kind in protected_roles:
+        return 1.0
+    return 0.45
 
 
 def _lexical_cosine(left: str, right: str) -> float:

@@ -50,7 +50,9 @@ class CandidateReranker:
         )
         # 中文：变量 `passages` 用于保存“`passages`”相关数据；其精确定义与约束见下方英文说明。
         # English: Passage order is aligned with valid candidates.
-        passages = tuple(chunks[candidate.chunk_id].text for candidate in valid_candidates)
+        # 中文：重排输入包含标题路径、编号和 Child 正文，但不会把重复 Parent 全文送入模型。
+        # English: Reranking sees headings, identifiers, and child body without repeated parents.
+        passages = tuple(chunks[candidate.chunk_id].search_text for candidate in valid_candidates)
         try:
             scores = self._provider.score(query, passages)
             if len(scores) != len(valid_candidates):

@@ -1,56 +1,140 @@
-# API
+# V4 HTTP API
 
-所有接口位于 `/api/v1`。开发配置允许使用以下 Demo Header：
+默认前缀为 `/api/v1`，交互式 OpenAPI 位于 `/docs`。除健康检查外，所有端点都需要经过配置模式验证的身份。
+
+## 认证
+
+| 模式 | 请求 | 使用场景 |
+|---|---|---|
+| `demo` | 开发身份头 | 仅本机开发，生产启动会拒绝 |
+| `jwt` | `Authorization: Bearer <token>` | 默认生产模式 |
+| `trusted_proxy` | 代理共享密钥和清洗后的身份头 | 企业统一网关后端 |
+
+JWT 使用 HS256，必须包含有效的 `sub`、`tenant_id`、`iss`、`aud` 和 `exp`；可包含 `roles`、`source_ids`、`group_ids`。客户端提交的租户或管理员头在 JWT 模式下不会被信任。
+
+开发模式示例头：
 
 ```text
-X-User-ID
-X-Tenant-ID
-X-Roles
-X-Source-IDs
-X-Group-IDs
+X-User-Id: demo-admin
+X-Tenant-Id: demo-tenant
+X-Roles: admin
 ```
 
-生产配置禁用 Demo 身份；若启用将无法通过 Settings 校验。
+下方示例统一使用 `$AUTH`：
 
-| 方法 | 路径 | 功能 |
-|---|---|---|
-| `POST` | `/documents` | 上传资料，返回 `202`、Document/Version/Job ID |
-| `GET` | `/documents/{id}` | 查询权限范围内的文档状态 |
-| `DELETE` | `/documents/{id}` | 两阶段删除并重建索引 |
-| `POST` | `/documents/{id}/retry` | 重试失败接入任务 |
-| `POST` | `/documents/{id}/reprocess` | 使用 Source 当前画像创建新处理版本 |
-| `GET` | `/sources` | 列出调用者可见资料源 |
-| `PATCH` | `/sources/{id}/content-profile` | 管理员更新资料源内容画像 |
-| `GET` | `/indexes` | 管理员查看不可变索引历史 |
-| `POST` | `/indexes/rebuild` | 管理员重建活动索引 |
-| `POST` | `/chat` | 返回已验证答案或结构化拒答 |
-| `GET` | `/traces/{id}` | 查询本人或管理员可见的脱敏 Trace |
-| `GET` | `/health/live` | 进程存活 |
-| `GET` | `/health/ready` | 数据库就绪 |
+```bash
+export AUTH='Authorization: Bearer eyJ...'
+```
 
-错误使用稳定信封：
+## 健康检查
+
+### `GET /health/live`
+
+仅验证进程存活，返回 `status` 与 `version`。
+
+### `GET /health/ready`
+
+检查依赖容器、数据库与活动运行条件；用于容器健康检查。
+
+## 资料源
+
+### `GET /sources`
+
+返回调用者可访问的活动资料源，已应用租户、可见性、用户组和显式授权过滤。
+
+### `PATCH /sources/{source_id}/content-profile`
+
+仅管理员。更新内容画像只影响后续新版本；已有文档必须显式 reprocess。
+
+```bash
+curl -X PATCH http://127.0.0.1:8000/api/v1/sources/source-id/content-profile \
+  -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"content_profile":"manual","chunk_strategy_override":null}'
+```
+
+可用画像：`general_prose`、`manual`、`technical_doc`、`regulation`、`academic`、`narrative`。
+
+## 文档
+
+### `POST /documents`
+
+上传 PDF、Markdown 或 TXT，并创建持久化异步任务。请求是 `multipart/form-data`，字段为 `source_id`、`file` 和可选 `title`。
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/documents \
+  -H "$AUTH" \
+  -F source_id=source-id \
+  -F title='设备维护手册' \
+  -F file=@manual.pdf
+```
+
+成功返回 `202`：
 
 ```json
 {
-  "error": {
-    "code": "ACTIVE_INDEX_NOT_FOUND",
-    "category": "retrieval",
-    "message": "No active knowledge index is available for this tenant.",
-    "context": null
-  }
+  "document_id": "doc_...",
+  "document_version_id": "ver_...",
+  "job_id": "job_...",
+  "status": "pending"
 }
 ```
 
-API Router 只能调用 Service。索引、Repository、FileStore 和模型 Provider 不会直接暴露给 HTTP 层。
+### `GET /documents/{document_id}`
 
-上传请求体超过配置上限时，ASGI middleware 在 multipart 解析前返回：
+返回生命周期状态、活动版本、稳定错误码、内容画像、切块策略版本和质量指标。
 
-```json
-{
-  "error": {
-    "code": "REQUEST_BODY_TOO_LARGE",
-    "category": "validation",
-    "message": "The request body exceeds the configured size limit."
-  }
-}
+### `POST /documents/{document_id}/retry`
+
+只为失败接入任务创建新 attempt，不改变不可变原文件。
+
+### `POST /documents/{document_id}/reprocess`
+
+使用资料源当前画像和运行配置创建新的不可变文档版本。旧活动版本继续服务，直至候选版本成功发布。
+
+### `DELETE /documents/{document_id}`
+
+立即进入删除 fencing，取消或阻断旧任务，重建不含该文档的活动快照，最终返回索引发布结果。响应不表示可以恢复原文件；生产操作前应按组织策略备份。
+
+## 问答
+
+### `POST /chat`
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/chat \
+  -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"query":"设备维护前需要执行什么？","requested_source_ids":["source-id"]}'
 ```
+
+回答响应包含 `trace_id`、`answer`、精确 Child 引用、活动 `index_version_id` 和检索轮数。引用包含文档、版本、Source、页码和原文摘录。
+
+证据不足、文档处理中、需要 OCR、权限不足或超时时返回 `status=refused`、稳定 `refusal_reason` 和安全消息。系统故障通过统一错误响应和 HTTP 状态暴露，不会伪装成知识库拒答。
+
+## 索引
+
+### `GET /indexes`
+
+仅租户管理员可查看不可变索引历史、状态、Chunk 数、配置指纹和激活时间。
+
+### `POST /indexes/rebuild`
+
+仅管理员。基于当前 `READY` 文档构建候选快照，验证后执行 CAS 激活；失败不影响旧活动索引。
+
+## Trace
+
+### `GET /traces/{trace_id}`
+
+仅请求发起者或同租户管理员可读。返回经过脱敏的步骤和聚合指标，包括路由、检索轮次、证据数量、动态 Top-K、Parent 扩展、超时和引用验证结果，不返回密钥或未经授权正文。
+
+## 常见状态码
+
+| 状态码 | 含义 |
+|---:|---|
+| 200 | 成功或结构化问答结果 |
+| 202 | 接入/重处理任务已入队 |
+| 400/422 | 请求或配置字段无效 |
+| 401 | 身份缺失或验证失败 |
+| 403 | 租户/Source/管理员权限不足 |
+| 404 | 资源不存在或对调用者不可见 |
+| 409 | 生命周期、租约或索引 CAS 冲突 |
+| 413 | 请求体或文件超过限制 |
+| 500/503 | 系统依赖或就绪状态异常 |

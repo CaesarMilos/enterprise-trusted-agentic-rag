@@ -14,6 +14,7 @@ from enterprise_rag.agent.evidence_grader import EvidenceGrader
 from enterprise_rag.agent.intent_router import IntentRouter
 from enterprise_rag.agent.query_rewriter import QueryRewriter
 from enterprise_rag.agent.state import AgentState
+from enterprise_rag.core.deadline import DeadlineBudget
 from enterprise_rag.core.enums import AgentStatus, IntentType, RefusalReason
 from enterprise_rag.core.exceptions import ErrorDetail, OperationTimeoutError
 from enterprise_rag.domain.results import AnswerResult, RefusalResult
@@ -90,7 +91,11 @@ class AgentOrchestrator:
         error.
         """
 
-        self._ensure_time(state)
+        initial_remaining = (state.deadline - datetime.now(UTC)).total_seconds()
+        if initial_remaining <= 0:
+            self._ensure_time(state, None, "workflow_start")
+        deadline = DeadlineBudget.from_timeout(initial_remaining)
+        self._ensure_time(state, deadline, "workflow_start")
         # 中文：本步骤涉及意图、模型、预算，具体约束见下方英文说明。
         # English: Intent classification is deterministic and consumes no model budget.
         state.intent = self._intent_router.classify(state.original_query)
@@ -102,7 +107,7 @@ class AgentOrchestrator:
         # English: Maximum total retrievals equals initial attempt plus configured rewrites.
         max_rounds = 1 + self._max_retrieval_retries
         while state.retrieval_rounds < max_rounds:
-            self._ensure_time(state)
+            self._ensure_time(state, deadline, "before_retrieval")
             state.status = AgentStatus.RETRIEVING
             # 中文：变量 `round_number` 用于保存“`round``number`”相关数据；
             # 其精确定义与约束见下方英文说明。
@@ -110,6 +115,9 @@ class AgentOrchestrator:
             #   retriever.
             round_number = state.retrieval_rounds + 1
             evidence = self._retrieve(state.current_query, round_number)
+            # 中文：检索迟到结果在使用前丢弃，超时不得伪装成“无证据”。
+            # English: Discard late retrieval before use; timeout is not "no evidence".
+            self._ensure_time(state, deadline, "after_retrieval")
             state.retrieval_rounds = round_number
             state.evidence = evidence
             self._emit(
@@ -139,7 +147,7 @@ class AgentOrchestrator:
             )
             state.evidence_grade_reasons.append(grade.reason)
             if grade.sufficient:
-                return self._generate_and_verify(state, trace_step)
+                return self._generate_and_verify(state, deadline, trace_step)
             if state.retrieval_rounds >= max_rounds:
                 break
             # 中文：本步骤涉及查询、模型，具体约束见下方英文说明。
@@ -153,6 +161,7 @@ class AgentOrchestrator:
                     current_query=state.current_query,
                     grade=grade,
                     history=tuple(state.rewrite_history),
+                    timeout_seconds=deadline.remaining_seconds(),
                 )
             except ValueError:
                 # 中文：变量 `break` 用于保存“`break`”相关数据；
@@ -160,6 +169,7 @@ class AgentOrchestrator:
                 # English: Duplicate or empty rewrite cannot improve evidence and ends the
                 #   loop safely.
                 break
+            self._ensure_time(state, deadline, "after_query_rewrite")
             self._record_usage(
                 state,
                 response.usage.input_tokens,
@@ -183,6 +193,7 @@ class AgentOrchestrator:
     def _generate_and_verify(
         self,
         state: AgentState,
+        deadline: DeadlineBudget,
         trace_step: Callable[[str, Mapping[str, object]], None] | None = None,
     ) -> AnswerResult | RefusalResult:
         """中文：该内部函数负责“生成并且验证”相关处理。
@@ -193,9 +204,16 @@ class AgentOrchestrator:
         if state.evidence is None:
             raise ValueError("answer generation requires evidence")
         self._ensure_model_budget(state)
-        self._ensure_time(state)
+        self._ensure_time(state, deadline, "before_answer_generation")
         state.status = AgentStatus.GENERATING
-        response = self._answer_generator.generate(state.original_query, state.evidence)
+        response = self._answer_generator.generate(
+            state.original_query,
+            state.evidence,
+            timeout_seconds=deadline.remaining_seconds(),
+        )
+        # 中文：模型在截止后返回的文本永远不会进入用量、答案或引用处理。
+        # English: Model text returned after expiry never reaches usage, answer, or citations.
+        self._ensure_time(state, deadline, "after_answer_generation")
         self._record_usage(
             state,
             response.usage.input_tokens,
@@ -220,11 +238,13 @@ class AgentOrchestrator:
                 index_version_id=state.index_version_id,
             )
         state.status = AgentStatus.VERIFYING
+        self._ensure_time(state, deadline, "before_citation_verification")
         verification = self._citation_verifier.verify(
             state.answer_draft,
             state.evidence,
             state.retrieval_scope,
         )
+        self._ensure_time(state, deadline, "after_citation_verification")
         self._emit(
             trace_step,
             "citations_verified",
@@ -289,7 +309,7 @@ class AgentOrchestrator:
         return RefusalResult(
             trace_id=state.trace_id,
             reason=RefusalReason.UNSUPPORTED_REQUEST,
-            message="V0.3 answers questions grounded in authorized enterprise documents.",
+            message="V4 answers questions grounded in authorized enterprise documents.",
             index_version_id=None,
         )
 
@@ -316,24 +336,30 @@ class AgentOrchestrator:
             raise RuntimeError("agent token budget exceeded")
 
     @staticmethod
-    def _ensure_time(state: AgentState) -> None:
-        """中文：该内部函数负责“确保时间”相关处理。
+    def _ensure_time(
+        state: AgentState,
+        deadline: DeadlineBudget | None,
+        stage: str,
+    ) -> None:
+        """中文：同时检查 UTC 与单调时钟截止点，并记录发生超时的阶段。
 
-        English: Raise a typed timeout when the workflow reaches its absolute deadline.
+        English: Check UTC and monotonic deadlines and record the stage at which time expired.
         """
 
-        if datetime.now(UTC) >= state.deadline:
+        if datetime.now(UTC) >= state.deadline or (
+            deadline is not None and deadline.remaining_seconds() <= 0
+        ):
             state.status = AgentStatus.TIMEOUT
             raise OperationTimeoutError(
                 # 中文：此处调用 `_timeout_detail` 以执行“`timeout``detail`”相关步骤；
                 # 具体约束见下方英文说明。
                 # English: Imported lazily avoids duplicating error construction at other
                 #   state transitions.
-                _timeout_detail()
+                _timeout_detail(stage)
             )
 
 
-def _timeout_detail() -> ErrorDetail:
+def _timeout_detail(stage: str) -> ErrorDetail:
     """中文：该内部函数负责“超时详情”相关处理。
 
     English: Create the structured timeout detail required by OperationTimeoutError.
@@ -343,7 +369,8 @@ def _timeout_detail() -> ErrorDetail:
     from enterprise_rag.core.exceptions import error_detail
 
     return error_detail(
-        "AGENT_TIMEOUT",
+        "AGENT_DEADLINE_EXCEEDED",
         ErrorCategory.TIMEOUT,
-        "The question-answering workflow exceeded its deadline.",
+        "The question-answering workflow exceeded its hard deadline.",
+        stage=stage,
     )

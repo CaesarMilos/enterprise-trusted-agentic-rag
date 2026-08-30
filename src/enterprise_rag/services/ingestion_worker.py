@@ -12,7 +12,12 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.orm import Session, sessionmaker
 
 from enterprise_rag.core.enums import DocumentStatus, JobStatus
-from enterprise_rag.core.exceptions import EnterpriseRAGError, LeaseLostError
+from enterprise_rag.core.exceptions import (
+    EnterpriseRAGError,
+    JobCancelledError,
+    LeaseLostError,
+    LifecycleFenceError,
+)
 from enterprise_rag.domain.models import JobFence, job_fence_from_job
 from enterprise_rag.domain.protocols.storage import FileStore
 from enterprise_rag.infrastructure.persistence.database import transactional_session
@@ -115,6 +120,9 @@ class IngestionWorker:
                     "The logical document no longer exists.",
                 )
                 return True
+            # 中文：领取租约后立即验证文档 generation；删除竞态在昂贵解析前终止。
+            # English: Validate document generation after claim so deletion stops before parsing.
+            repositories.assert_job_fence(fence, datetime.now(UTC))
             # 中文：关键变量 `has_active_version` 冻结失败恢复语义，候选任务不影响旧服务。
             # English: Key variable `has_active_version` freezes failure semantics so a candidate
             # cannot interrupt old service.
@@ -124,6 +132,7 @@ class IngestionWorker:
                     job.tenant_id,
                     job.document_id,
                     DocumentStatus.PROCESSING,
+                    expected_generation=fence.document_generation,
                 )
         try:
             # 中文：关键变量 `lease_guard` 在 OCR、Embedding 和索引构建期间持续续租。
@@ -187,7 +196,20 @@ class IngestionWorker:
                     job.id,
                     fence,
                 )
-        except LeaseLostError:
+        except JobCancelledError:
+            # 中文：取消只收口任务，不得把删除中的文档改为 FAILED。
+            # English: Cancellation closes only the job and never marks a deleting document failed.
+            try:
+                with transactional_session(self._sessions) as session:
+                    SQLAlchemyRepositories(session).mark_job_cancelled(
+                        fence,
+                        datetime.now(UTC),
+                        "lifecycle_cancelled",
+                    )
+            except (LeaseLostError, LifecycleFenceError, JobCancelledError):
+                pass
+            return True
+        except (LeaseLostError, LifecycleFenceError):
             # 中文：失租是所有权转移而非任务失败；旧 Worker 不得再写任何终态。
             # English: Lease loss transfers ownership; the old worker must write no terminal state.
             return True
@@ -242,8 +264,9 @@ class IngestionWorker:
                             job.tenant_id,
                             job.document_id,
                             document_status,
+                            expected_generation=fence.document_generation,
                         )
-            except LeaseLostError:
+            except (LeaseLostError, LifecycleFenceError, JobCancelledError):
                 # 中文：异常处理期间失租同样禁止旧 Worker 覆盖新代次的终态。
                 # English: Losing the lease during error handling also forbids stale writes.
                 return True

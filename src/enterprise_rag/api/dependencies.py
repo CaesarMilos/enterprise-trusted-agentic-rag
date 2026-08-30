@@ -26,6 +26,7 @@ from enterprise_rag.agent.intent_router import IntentRouter
 from enterprise_rag.agent.orchestrator import AgentOrchestrator
 from enterprise_rag.agent.query_rewriter import QueryRewriter
 from enterprise_rag.core.config import Settings, load_settings
+from enterprise_rag.core.enums import AuthenticationMode
 from enterprise_rag.core.ids import content_sha256
 from enterprise_rag.domain.models import Chunk, RetrievalScope, UserContext
 from enterprise_rag.domain.protocols.models import EmbeddingProvider
@@ -50,6 +51,7 @@ from enterprise_rag.infrastructure.rerankers.cross_encoder import CrossEncoderRe
 from enterprise_rag.infrastructure.storage.local_file_store import LocalFileStore
 from enterprise_rag.ingestion.boundary_analyzer import EmbeddingSimilarity, LLMBoundaryJudge
 from enterprise_rag.ingestion.chunk_strategies import build_default_strategy_registry
+from enterprise_rag.ingestion.chunking.boundary_scorer import BoundaryWeights
 from enterprise_rag.ingestion.cleaner import TextCleaner
 from enterprise_rag.ingestion.loader_registry import LoaderRegistry
 from enterprise_rag.ingestion.loaders.markdown_loader import MarkdownLoader
@@ -68,10 +70,13 @@ from enterprise_rag.retrieval.dense_retriever import DenseRetriever
 from enterprise_rag.retrieval.dynamic_top_k import DynamicTopK
 from enterprise_rag.retrieval.fusion import ReciprocalRankFusion
 from enterprise_rag.retrieval.hybrid_retriever import HybridRetriever
+from enterprise_rag.retrieval.parent_expander import ParentExpander
 from enterprise_rag.retrieval.query_normalizer import QueryNormalizer
 from enterprise_rag.retrieval.reranker import CandidateReranker
 from enterprise_rag.retrieval.source_profile_catalog import SourceProfileCatalog
 from enterprise_rag.retrieval.source_router import SourceRouter
+from enterprise_rag.security.jwt_auth import decode_hs256_user_context
+from enterprise_rag.security.startup import validate_security_startup
 from enterprise_rag.services.chat_service import ChatService
 from enterprise_rag.services.ingestion_service import IngestionService
 from enterprise_rag.services.ingestion_worker import IngestionWorker
@@ -152,6 +157,9 @@ def build_container(settings: Settings | None = None) -> AppContainer:
     # 中文：变量 `configured` 用于保存“`configured`”相关数据；其精确定义与约束见下方英文说明。
     # English: Explicit settings support tests; cached defaults support process startup.
     configured = settings or default_settings()
+    # 中文：生产认证缺失时在任何数据库、索引或监听端口创建前失败。
+    # English: Fail secure before creating databases, indexes, or listening sockets.
+    validate_security_startup(configured)
     # 中文：变量 `engine` 用于保存“`engine`”相关数据；其精确定义与约束见下方英文说明。
     # English: Database engine and tables are initialized before repository-backed services.
     engine = create_database_engine(
@@ -210,6 +218,14 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         ambiguity_margin=configured.ingestion.semantic_ambiguity_margin,
         create_parent_chunks=configured.ingestion.parent_chunks_enabled,
         max_llm_boundaries=configured.ingestion.llm_boundary_max_calls,
+        base_boundary_threshold=configured.ingestion.adaptive_boundary_threshold,
+        boundary_weights=BoundaryWeights(
+            structure=configured.ingestion.boundary_structure_weight,
+            semantic_gap=configured.ingestion.boundary_semantic_weight,
+            length_pressure=configured.ingestion.boundary_length_weight,
+            marker_change=configured.ingestion.boundary_marker_weight,
+            role_change=configured.ingestion.boundary_role_weight,
+        ),
     )
     # 中文：关键变量 `effective_chunk_parameters` 同时写入版本快照和 Worker 校验器。
     # English: Key variable `effective_chunk_parameters` feeds both snapshots and worker checks.
@@ -222,6 +238,14 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         "llm_boundary_enabled": configured.ingestion.llm_boundary_enabled,
         "llm_boundary_max_calls": configured.ingestion.llm_boundary_max_calls,
         "parent_chunks_enabled": configured.ingestion.parent_chunks_enabled,
+        "adaptive_boundary_threshold": configured.ingestion.adaptive_boundary_threshold,
+        "boundary_weights": {
+            "structure": configured.ingestion.boundary_structure_weight,
+            "semantic_gap": configured.ingestion.boundary_semantic_weight,
+            "length_pressure": configured.ingestion.boundary_length_weight,
+            "marker_change": configured.ingestion.boundary_marker_weight,
+            "role_change": configured.ingestion.boundary_role_weight,
+        },
     }
     # 中文：变量 `pipeline` 负责 PDF、Markdown 和 TXT 的统一接入准备。
     # English: `pipeline` prepares PDF, Markdown, and TXT through one ingestion path.
@@ -237,7 +261,7 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         structure_parser=StructureParser(),
         strategy_registry=strategy_registry,
         metadata_extractor=MetadataExtractor(),
-        quality_validator=ChunkQualityValidator(),
+        quality_validator=ChunkQualityValidator(configured.ingestion.max_chunk_tokens),
         runtime_chunk_parameters=effective_chunk_parameters,
         runtime_embedding_fingerprint=embeddings.fingerprint,
         runtime_boundary_model_fingerprint=(
@@ -356,9 +380,14 @@ def build_container(settings: Settings | None = None) -> AppContainer:
                 configured.retrieval.default_k,
                 configured.retrieval.max_k,
                 configured.retrieval.context_token_budget,
+                max_document_share=configured.retrieval.max_document_share,
             ),
             ContextBuilder(),
             load_chunks,
+            ParentExpander(
+                configured.retrieval.max_parent_tokens,
+                configured.retrieval.context_token_budget,
+            ),
         )
         return AgentOrchestrator(
             IntentRouter(),
@@ -421,16 +450,21 @@ def get_user_context(
     source_ids: Annotated[str | None, Header(alias="X-Source-IDs")] = None,
     group_ids: Annotated[str | None, Header(alias="X-Group-IDs")] = None,
     proxy_secret: Annotated[str | None, Header(alias="X-Auth-Proxy-Secret")] = None,
+    gateway_secret: Annotated[
+        str | None, Header(alias="X-Enterprise-RAG-Proxy-Secret")
+    ] = None,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
 ) -> UserContext:
     """中文：该函数或方法负责“获取用户上下文”相关处理。
 
     English: Construct a trusted identity from explicit demo mode or a verified proxy adapter.
     """
 
-    if container.settings.security.demo_auth_enabled:
+    mode = container.settings.security.authentication_mode
+    if mode is AuthenticationMode.DEMO:
         resolved_user_id = user_id or "demo-admin"
         resolved_tenant_id = tenant_id or container.settings.security.default_tenant_id
-    elif container.settings.security.trusted_proxy_auth_enabled:
+    elif mode is AuthenticationMode.TRUSTED_PROXY:
         # 中文：共享密钥只从环境读取并使用恒定时间比较，绝不写入日志或响应。
         # English: The shared secret comes only from the environment, is compared in constant
         # time, and is never logged or returned.
@@ -440,7 +474,10 @@ def get_user_context(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Trusted proxy authentication is not fully configured.",
             )
-        if proxy_secret is None or not secrets.compare_digest(proxy_secret, expected_secret):
+        supplied_secret = gateway_secret or proxy_secret
+        if supplied_secret is None or not secrets.compare_digest(
+            supplied_secret, expected_secret
+        ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Trusted proxy authentication failed.",
@@ -452,6 +489,25 @@ def get_user_context(
             )
         resolved_user_id = user_id
         resolved_tenant_id = tenant_id
+    elif mode is AuthenticationMode.JWT:
+        if authorization is None or not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="A Bearer token is required.",
+            )
+        jwt_secret = os.getenv(container.settings.security.jwt_secret_env, "")
+        try:
+            return decode_hs256_user_context(
+                authorization.removeprefix("Bearer ").strip(),
+                jwt_secret,
+                container.settings.security.jwt_issuer,
+                container.settings.security.jwt_audience,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="The Bearer token is invalid.",
+            ) from exc
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -459,7 +515,7 @@ def get_user_context(
         )
     # 中文：只有显式 Demo 模式提供管理员缺省值；生产代理必须明确传递角色。
     # English: Only explicit demo mode defaults to admin; production proxies must send roles.
-    default_roles = "admin" if container.settings.security.demo_auth_enabled else ""
+    default_roles = "admin" if mode is AuthenticationMode.DEMO else ""
     resolved_roles = frozenset(_csv(roles or default_roles))
     return UserContext(
         user_id=resolved_user_id,

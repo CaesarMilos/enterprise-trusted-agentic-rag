@@ -189,6 +189,15 @@ class Document:
     # 其精确定义与约束见下方英文说明。
     # English: Active immutable document version, if ingestion has completed.
     active_version_id: str | None = None
+    # 中文：每次删除请求递增；旧任务必须携带创建时快照才能进行任何持久写入。
+    # English: Incremented on deletion; jobs must match their creation-time snapshot to write.
+    lifecycle_generation: int = 0
+    # 中文：删除请求时间用于审计、幂等响应和超时清理。
+    # English: Deletion-request time supports auditing, idempotency, and stale-work cleanup.
+    delete_requested_at: datetime | None = None
+    # 中文：物理与逻辑删除闭环完成时间；完成前保持 PENDING_DELETE。
+    # English: Completion time for logical and physical deletion; pending until both finish.
+    deleted_at: datetime | None = None
     # 中文：变量 `created_at` 用于保存“`created``at`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Creation timestamp used for auditing.
@@ -250,7 +259,7 @@ class DocumentVersion:
     chunk_strategy_id: str = "general-prose"
     # 中文：变量 `chunk_strategy_version` 冻结实际算法版本，支持确定性重处理和审计。
     # English: `chunk_strategy_version` freezes the algorithm version for reproducible reprocessing.
-    chunk_strategy_version: str = "general-prose-v2"
+    chunk_strategy_version: str = "general-prose-v4"
     # 中文：变量 `chunk_parameters` 保存创建版本时生效的关键切块参数快照。
     # English: `chunk_parameters` stores the effective chunk-parameter snapshot.
     chunk_parameters: dict[str, Any] = field(default_factory=dict)
@@ -260,6 +269,15 @@ class DocumentVersion:
     # 中文：变量 `boundary_model_fingerprint` 记录可选 LLM 边界复核模型与提示词版本。
     # English: `boundary_model_fingerprint` records the optional LLM reviewer and prompt version.
     boundary_model_fingerprint: str | None = None
+    # 中文：确定性画像识别置信度；低置信度版本必须使用 general_fallback。
+    # English: Deterministic profile confidence; low values require general_fallback.
+    profile_confidence: float = 1.0
+    # 中文：冻结 Tokenizer 标识，确保长度边界可以复现。
+    # English: Freeze tokenizer identity so length boundaries remain reproducible.
+    tokenizer_id: str = "unicode-codepoint-v1"
+    # 中文：冻结解析与 OCR 流水线版本，避免重建时发生静默漂移。
+    # English: Freeze parser and OCR pipeline version to prevent silent rebuild drift.
+    extraction_pipeline_version: str = "extraction-v4"
     # 中文：变量 `quality_metrics` 保存接入质量门输出，供管理界面和回归评估使用。
     # English: `quality_metrics` persists the quality-gate output for administration and regression.
     quality_metrics: dict[str, Any] = field(default_factory=dict)
@@ -364,6 +382,24 @@ class Chunk:
     # English: Additional format-specific values that are safe to index.
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def body_text(self) -> str:
+        """中文：返回未经检索元数据扩展的可展示、可引用原文。
+
+        English: Return displayable, citable source text without retrieval metadata expansion.
+        """
+
+        return self.text
+
+    @property
+    def search_text(self) -> str:
+        """中文：返回建索引文本；旧数据为空时安全回退到正文。
+
+        English: Return indexing text and safely fall back to body text for historical rows.
+        """
+
+        return self.retrieval_text or self.text
+
 
 @dataclass(frozen=True, slots=True)
 class IngestionJob:
@@ -385,6 +421,9 @@ class IngestionJob:
     # 其精确定义与约束见下方英文说明。
     # English: Immutable document version being processed.
     document_version_id: str
+    # 中文：任务入队时冻结文档 generation；任何不匹配都意味着任务已经过期。
+    # English: Freeze the document generation at enqueue time; any mismatch makes the job stale.
+    document_generation_snapshot: int = 0
     # 中文：变量 `status` 用于保存“状态”相关数据；其精确定义与约束见下方英文说明。
     # English: Durable task state.
     status: JobStatus = JobStatus.PENDING
@@ -406,6 +445,12 @@ class IngestionJob:
     # 中文：变量 `error_message` 用于保存“错误消息”相关数据；其精确定义与约束见下方英文说明。
     # English: Redacted failure message safe to expose to administrators.
     error_message: str | None = None
+    # 中文：持久取消请求允许正在运行的 Worker 在每个阶段边界安全停止。
+    # English: A durable cancellation request lets running workers stop at every stage boundary.
+    cancel_requested_at: datetime | None = None
+    # 中文：结构化取消原因用于区分删除、管理员操作和发布冲突。
+    # English: A structured reason distinguishes deletion, administration, and publication conflict.
+    cancel_reason: str | None = None
     # 中文：变量 `created_at` 用于保存“`created``at`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Creation timestamp used for FIFO task ordering.
@@ -435,6 +480,12 @@ class JobFence:
     # 中文：变量 `attempt_count` 是每次重新领取递增的 fencing generation。
     # English: `attempt_count` is the fencing generation incremented on every claim.
     attempt_count: int
+    # 中文：文档标识将租约 fencing 与文档生命周期 fencing 绑定为一个写入令牌。
+    # English: Document identity binds lease fencing and lifecycle fencing into one write token.
+    document_id: str = ""
+    # 中文：必须等于数据库当前 generation，否则即使租约有效也禁止写入。
+    # English: Must equal the current database generation even while the lease remains valid.
+    document_generation: int = 0
 
 
 def job_fence_from_job(job: IngestionJob) -> JobFence:
@@ -452,6 +503,8 @@ def job_fence_from_job(job: IngestionJob) -> JobFence:
         job_id=job.id,
         lease_owner=job.lease_owner,
         attempt_count=job.attempt_count,
+        document_id=job.document_id,
+        document_generation=job.document_generation_snapshot,
     )
 
 
@@ -490,6 +543,15 @@ class IndexVersion:
     # 其精确定义与约束见下方英文说明。
     # English: Activation timestamp, present only after transactional publication.
     activated_at: datetime | None = None
+    # 中文：失败或取消的稳定错误码用于运维告警和状态收口。
+    # English: Stable failure/cancellation code supports operations and terminal reconciliation.
+    error_code: str | None = None
+    # 中文：安全错误摘要不得包含文档正文、凭据或提供方密钥。
+    # English: Safe error summary must not include document text, credentials, or provider secrets.
+    error_message: str | None = None
+    # 中文：发布事务结束时间覆盖 ACTIVE、FAILED 与 CANCELLED 等终态。
+    # English: Publication completion time covers ACTIVE, FAILED, and CANCELLED terminal outcomes.
+    completed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

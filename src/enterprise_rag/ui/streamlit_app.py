@@ -23,6 +23,12 @@ DEMO_HEADERS = {
     "X-Tenant-ID": os.getenv("ENTERPRISE_RAG_DEMO_TENANT", "demo-tenant"),
     "X-Roles": os.getenv("ENTERPRISE_RAG_DEMO_ROLES", "admin"),
 }
+# 中文：生产 UI 使用短期 JWT；配置后不再发送任何可伪造的 Demo 身份头。
+# English: Production UI uses a short-lived JWT and sends no forgeable demo identity headers.
+_ACCESS_TOKEN = os.getenv("ENTERPRISE_RAG_ACCESS_TOKEN", "").strip()
+REQUEST_HEADERS = (
+    {"Authorization": f"Bearer {_ACCESS_TOKEN}"} if _ACCESS_TOKEN else DEMO_HEADERS
+)
 
 
 def _request(method: str, path: str, **kwargs: Any) -> dict[str, object] | list[object]:
@@ -37,7 +43,7 @@ def _request(method: str, path: str, **kwargs: Any) -> dict[str, object] | list[
         response = httpx.request(
             method,
             f"{API_BASE_URL}{path}",
-            headers=DEMO_HEADERS,
+            headers=REQUEST_HEADERS,
             timeout=90.0,
             **kwargs,
         )
@@ -100,8 +106,8 @@ def render_documents() -> None:
         st.info("Create or seed a knowledge source before uploading documents.")
         return
     selected_name = st.selectbox("Knowledge source", tuple(source_names))
-    # 中文：V0.3 接收 PDF、Markdown 和 TXT；缺失文本层的页面必须由后端 OCR 补齐。
-    # English: V0.3 accepts PDF, Markdown, and TXT; pages without text require backend OCR.
+    # 中文：V4 接收 PDF、Markdown 和 TXT；缺失文本层的页面必须由后端 OCR 补齐。
+    # English: V4 accepts PDF, Markdown, and TXT; pages without text require backend OCR.
     uploaded = st.file_uploader(
         "PDF, Markdown, or TXT (maximum 50 MiB)",
         type=["pdf", "md", "txt"],
@@ -147,9 +153,16 @@ def render_admin() -> None:
         with st.form("source-profile-form"):
             selected_name = st.selectbox("Knowledge source", tuple(source_by_name))
             selected_source = source_by_name[selected_name]
-            # 中文：变量 `profile_options` 是当前正式支持的三种资料源内容画像。
-            # English: Profile options are the three currently supported source profiles.
-            profile_options = ("general_prose", "manual", "technical_doc")
+            # 中文：变量 `profile_options` 是 V4 正式支持的六种受控内容画像。
+            # English: Profile options are the six controlled V4 content profiles.
+            profile_options = (
+                "general_prose",
+                "manual",
+                "technical_doc",
+                "regulation",
+                "academic",
+                "narrative",
+            )
             current_profile = str(selected_source.get("content_profile", "general_prose"))
             selected_profile = st.selectbox(
                 "Content profile",

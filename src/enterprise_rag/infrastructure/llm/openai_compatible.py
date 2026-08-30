@@ -67,6 +67,8 @@ class OpenAICompatibleLLM:
         system_prompt: str,
         user_prompt: str,
         metadata: Mapping[str, str] | None = None,
+        *,
+        timeout_seconds: float | None = None,
     ) -> ModelResponse:
         """中文：该函数或方法负责“完成一次模型调用”相关处理。
 
@@ -102,7 +104,14 @@ class OpenAICompatibleLLM:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+            # 中文：单次 HTTP 超时不得超过 Agent 剩余硬预算。
+            # English: Per-call HTTP timeout never exceeds the agent's remaining hard budget.
+            request_timeout = (
+                self._timeout_seconds
+                if timeout_seconds is None
+                else max(0.05, min(float(self._timeout_seconds), timeout_seconds))
+            )
+            with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise RuntimeError("chat completion request failed") from exc

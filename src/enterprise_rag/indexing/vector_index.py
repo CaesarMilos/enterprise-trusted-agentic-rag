@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from enterprise_rag.domain.models import RetrievalScope
 from enterprise_rag.indexing.models import IndexBuildPlan, IndexEntry
@@ -23,7 +24,12 @@ class VectorIndexBuilder:
     English: Build a FAISS IndexFlatIP artifact with an explicit integer-to-chunk mapping.
     """
 
-    def build(self, plan: IndexBuildPlan, vectors: np.ndarray, directory: Path) -> tuple[Path, ...]:
+    def build(
+        self,
+        plan: IndexBuildPlan,
+        vectors: npt.NDArray[np.float32],
+        directory: Path,
+    ) -> tuple[Path, ...]:
         """中文：该函数或方法负责“构建目标对象”相关处理。
 
         English: Write the vector component and aligned ACL metadata into a staging directory.

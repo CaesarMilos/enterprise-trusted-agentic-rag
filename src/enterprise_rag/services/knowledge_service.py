@@ -12,6 +12,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from enterprise_rag.core.enums import ContentProfile, DocumentStatus, ErrorCategory, IndexStatus
 from enterprise_rag.core.exceptions import (
+    JobCancelledError,
+    LeaseLostError,
+    LifecycleFenceError,
     NotFoundError,
     PermissionDeniedError,
     ValidationError,
@@ -153,21 +156,38 @@ class IndexBuildService:
                     document_id,
                     DocumentStatus.READY,
                     active_version_id=document_version_id,
+                    expected_generation=fence.document_generation,
                 )
                 repositories.mark_job_succeeded(fence, activation_time)
                 return previous
 
         try:
             previous_id = self._coordinator.build_and_publish(plan, activate)
-        except Exception:
+        except Exception as exc:
             # 中文：本步骤涉及失败的、快照、元数据，具体约束见下方英文说明。
             # English: Failed snapshot metadata is retained for diagnosis and recovery
             #   tooling.
             with transactional_session(self._sessions) as session:
+                # 中文：生命周期或所有权失效属于取消，不应伪装成索引实现故障。
+                # English: Lifecycle/ownership invalidation is cancellation, not an index fault.
+                terminal_status = (
+                    IndexStatus.CANCELLED
+                    if isinstance(
+                        exc,
+                        (JobCancelledError, LeaseLostError, LifecycleFenceError),
+                    )
+                    else IndexStatus.FAILED
+                )
                 SQLAlchemyRepositories(session).set_index_status(
                     tenant_id,
                     index_version_id,
-                    IndexStatus.FAILED,
+                    terminal_status,
+                    error_code=(
+                        exc.detail.code
+                        if hasattr(exc, "detail")
+                        else "INDEX_PUBLICATION_FAILED"
+                    ),
+                    error_message="The candidate index could not be published.",
                 )
             raise
         return IndexBuildResult(
@@ -229,7 +249,24 @@ class IndexBuildService:
                     expected_active_index_id,
                 )
 
-        previous_id = self._coordinator.build_and_publish(plan, activate)
+        try:
+            previous_id = self._coordinator.build_and_publish(plan, activate)
+        except Exception as exc:
+            # 中文：手动重建、删除重建与接入发布使用相同失败终态，杜绝永久 STAGING。
+            # English: Manual/delete/ingestion publication share one terminal failure outcome.
+            with transactional_session(self._sessions) as session:
+                SQLAlchemyRepositories(session).set_index_status(
+                    tenant_id,
+                    index_version_id,
+                    IndexStatus.FAILED,
+                    error_code=(
+                        exc.detail.code
+                        if hasattr(exc, "detail")
+                        else "INDEX_PUBLICATION_FAILED"
+                    ),
+                    error_message="The candidate index could not be published.",
+                )
+            raise
         return IndexBuildResult(
             index_version_id=index_version_id,
             chunk_count=len(plan.entries),
@@ -465,19 +502,28 @@ class KnowledgeService:
                         "The document does not exist.",
                     )
                 )
-            # 中文：本步骤涉及删除、活动、文本块、范围，具体约束见下方英文说明。
-            # English: PENDING_DELETE immediately removes content from active-chunk and
-            #   scope queries.
-            repositories.set_document_status(
+            # 中文：单次事务递增 generation 并取消任务；从此刻起旧 Worker 无权写入。
+            # English: One transaction increments generation and cancels jobs; stale workers stop.
+            deleting = repositories.request_document_deletion(
                 user.tenant_id,
                 document_id,
-                DocumentStatus.PENDING_DELETE,
+                datetime.now(UTC),
             )
+            if deleting is None:
+                raise NotFoundError(
+                    error_detail(
+                        "DOCUMENT_NOT_FOUND",
+                        ErrorCategory.NOT_FOUND,
+                        "The document does not exist.",
+                    )
+                )
+            deletion_generation = deleting.lifecycle_generation
         result = self._rebuild_index(user.tenant_id)
         with transactional_session(self._sessions) as session:
-            SQLAlchemyRepositories(session).set_document_status(
+            SQLAlchemyRepositories(session).complete_document_deletion(
                 user.tenant_id,
                 document_id,
-                DocumentStatus.DELETED,
+                deletion_generation,
+                datetime.now(UTC),
             )
         return result

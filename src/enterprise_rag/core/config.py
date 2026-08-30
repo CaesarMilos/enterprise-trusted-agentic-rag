@@ -14,7 +14,7 @@ from typing import Any, Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from enterprise_rag.core.enums import ErrorCategory
+from enterprise_rag.core.enums import AuthenticationMode, ErrorCategory
 from enterprise_rag.core.exceptions import ValidationError, error_detail
 
 # 中文：变量 `_ENV_PREFIX` 用于保存“`env``prefix`”相关数据；其精确定义与约束见下方英文说明。
@@ -90,7 +90,7 @@ class IngestionSettings(FrozenSettingsModel):
     # 中文：变量 `chunker_version` 用于保存“切块器版本”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Version string included in deterministic chunk and index identities.
-    chunker_version: str = "adaptive-profile-strategy-v2"
+    chunker_version: str = "structure-constrained-adaptive-v4"
     # 中文：变量 `min_chunk_tokens` 用于保存“`min`文本块词元”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Soft lower bound below which adjacent text units should be combined.
@@ -109,6 +109,16 @@ class IngestionSettings(FrozenSettingsModel):
     # 中文：变量 `semantic_ambiguity_margin` 定义交给 LLM 复核的模糊分数带宽。
     # English: `semantic_ambiguity_margin` defines the ambiguous band eligible for LLM review.
     semantic_ambiguity_margin: float = Field(default=0.08, ge=0.0, le=0.5)
+    # 中文：以下五项是自适应边界总分中结构、语义、长度、标记和角色变化权重。
+    # English: These five values weight structure, semantic gap, length, marker, and role change.
+    boundary_structure_weight: float = Field(default=0.30, ge=0.0, le=1.0)
+    boundary_semantic_weight: float = Field(default=0.30, ge=0.0, le=1.0)
+    boundary_length_weight: float = Field(default=0.20, ge=0.0, le=1.0)
+    boundary_marker_weight: float = Field(default=0.10, ge=0.0, le=1.0)
+    boundary_role_weight: float = Field(default=0.10, ge=0.0, le=1.0)
+    # 中文：基础边界阈值由长度压力动态上调或下调，硬边界不参与阈值判断。
+    # English: Length pressure shifts this base threshold; hard boundaries bypass scoring.
+    adaptive_boundary_threshold: float = Field(default=0.58, ge=0.0, le=1.0)
     # 中文：变量 `llm_boundary_enabled` 控制是否只在模糊边界调用 LLM。
     # English: `llm_boundary_enabled` controls LLM calls for ambiguous boundaries only.
     llm_boundary_enabled: bool = False
@@ -144,6 +154,15 @@ class IngestionSettings(FrozenSettingsModel):
             raise ValueError(
                 "request body limit must exceed the file limit to allow multipart overhead"
             )
+        weight_sum = (
+            self.boundary_structure_weight
+            + self.boundary_semantic_weight
+            + self.boundary_length_weight
+            + self.boundary_marker_weight
+            + self.boundary_role_weight
+        )
+        if abs(weight_sum - 1.0) > 1e-6:
+            raise ValueError("adaptive boundary weights must sum to 1.0")
         return self
 
 
@@ -235,6 +254,15 @@ class RetrievalSettings(FrozenSettingsModel):
     # 其精确定义与约束见下方英文说明。
     # English: Maximum token budget available to the final evidence context.
     context_token_budget: int = Field(default=6000, ge=256)
+    # 中文：单个 Parent 最多消耗的上下文预算，防止大章节挤占全部证据。
+    # English: Maximum tokens one expanded parent may consume from the evidence budget.
+    max_parent_tokens: int = Field(default=1600, ge=128)
+    # 中文：同一 Parent 下允许进入最终候选集的 Child 上限。
+    # English: Maximum selected child hits that may originate from one parent.
+    max_children_per_parent: int = Field(default=2, ge=1, le=20)
+    # 中文：单一文档在最终证据包中的占比上限。
+    # English: Maximum share of final evidence that one document may occupy.
+    max_document_share: float = Field(default=0.6, gt=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_top_k_bounds(self) -> Self:
@@ -245,6 +273,8 @@ class RetrievalSettings(FrozenSettingsModel):
 
         if not self.min_k <= self.default_k <= self.max_k:
             raise ValueError("retrieval bounds must satisfy min_k <= default_k <= max_k")
+        if self.max_parent_tokens > self.context_token_budget:
+            raise ValueError("max_parent_tokens cannot exceed context_token_budget")
         return self
 
 
@@ -330,6 +360,9 @@ class SecuritySettings(FrozenSettingsModel):
     # 其精确定义与约束见下方英文说明。
     # English: Tenant used only by the explicitly enabled development identity provider.
     default_tenant_id: str = "demo-tenant"
+    # 中文：认证模式必须唯一；生产配置只能选择 JWT 或可信代理。
+    # English: Exactly one auth mode is active; production permits JWT or trusted proxy only.
+    authentication_mode: AuthenticationMode = AuthenticationMode.TRUSTED_PROXY
     # 中文：变量 `enforce_access_scope` 用于保存“`enforce``access`范围”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Whether every online retrieval must receive a concrete access scope.
@@ -344,6 +377,18 @@ class SecuritySettings(FrozenSettingsModel):
     # 中文：变量 `trusted_proxy_secret_env` 指定代理与应用共享密钥的环境变量名。
     # English: `trusted_proxy_secret_env` names the environment variable holding the proxy secret.
     trusted_proxy_secret_env: str = "ENTERPRISE_RAG_PROXY_SECRET"
+    # 中文：JWT HMAC 密钥仅通过该环境变量读取，绝不写入配置文件或日志。
+    # English: The JWT HMAC secret is read only from this environment variable.
+    jwt_secret_env: str = "ENTERPRISE_RAG_JWT_SECRET"
+    # 中文：验证令牌签发者，避免接受其他系统签发的相同格式令牌。
+    # English: Validate token issuer to reject structurally similar tokens from other systems.
+    jwt_issuer: str = "enterprise-rag"
+    # 中文：验证令牌受众，限制凭证只能用于本 API。
+    # English: Validate token audience so credentials are scoped to this API.
+    jwt_audience: str = "enterprise-rag-api"
+    # 中文：代理共享密钥头只证明请求来自受控网关，身份头仍会严格解析。
+    # English: The proxy secret header proves gateway origin; identity headers remain validated.
+    trusted_proxy_secret_header: str = "X-Enterprise-RAG-Proxy-Secret"
 
 
 class Settings(FrozenSettingsModel):
@@ -354,7 +399,7 @@ class Settings(FrozenSettingsModel):
 
     # 中文：变量 `config_version` 用于保存“配置版本”相关数据；其精确定义与约束见下方英文说明。
     # English: Schema version used to reject incompatible configuration files.
-    config_version: str = "1.0"
+    config_version: str = "4.0"
     # 中文：变量 `application` 用于保存“应用”相关数据；其精确定义与约束见下方英文说明。
     # English: General application configuration.
     application: ApplicationSettings = ApplicationSettings()
@@ -387,14 +432,27 @@ class Settings(FrozenSettingsModel):
     security: SecuritySettings = SecuritySettings()
 
     @model_validator(mode="after")
-    def reject_demo_auth_in_production(self) -> Self:
-        """中文：该函数或方法负责“拒绝演示认证在生产”相关处理。
+    def validate_authentication_mode(self) -> Self:
+        """中文：校验互斥认证模式及旧配置开关，禁止生产环境信任客户端身份头。
 
-        English: Prevent the convenience development identity from running in production.
+        English: Validate exclusive auth mode and compatibility flags; never trust client headers.
         """
 
-        if self.application.environment == "production" and self.security.demo_auth_enabled:
-            raise ValueError("demo_auth_enabled must be false in production")
+        is_production = self.application.environment == "production"
+        if self.config_version != "4.0":
+            raise ValueError("configuration schema version must be 4.0")
+        if is_production and self.security.authentication_mode is AuthenticationMode.DEMO:
+            raise ValueError("demo authentication mode is forbidden in production")
+        if self.security.demo_auth_enabled != (
+            self.security.authentication_mode is AuthenticationMode.DEMO
+        ):
+            raise ValueError("demo_auth_enabled must match authentication_mode=demo")
+        if self.security.trusted_proxy_auth_enabled != (
+            self.security.authentication_mode is AuthenticationMode.TRUSTED_PROXY
+        ):
+            raise ValueError(
+                "trusted_proxy_auth_enabled must match authentication_mode=trusted_proxy"
+            )
         return self
 
 

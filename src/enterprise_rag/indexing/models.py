@@ -121,7 +121,14 @@ class IndexBuildPlan:
         # 中文：变量 `ordered_chunks` 用于保存“`ordered`文本块”相关数据；
         # 其精确定义与约束见下方英文说明。
         # English: Ordered chunks eliminate repository-order differences across rebuilds.
-        ordered_chunks = tuple(sorted(chunks, key=lambda item: item.id))
+        # 中文：只有 Child/leaf 进入 BM25 与向量索引；Parent 仅在命中后按需扩展。
+        # English: Only child/leaf chunks enter search indexes; parents expand after a hit.
+        ordered_chunks = tuple(
+            sorted(
+                (chunk for chunk in chunks if chunk.chunk_level == "leaf"),
+                key=lambda item: item.id,
+            )
+        )
         # 中文：变量 `entries` 用于保存“`entries`”相关数据；其精确定义与约束见下方英文说明。
         # English: Index entries copy ACL metadata so search can filter before returning
         #   candidates.
@@ -135,7 +142,7 @@ class IndexBuildPlan:
                 # 中文：索引使用含标题和规范化编号的检索文本，引用仍展示原始正文。
                 # English: Index retrieval text includes headings and normalized identifiers,
                 # while citations still display the original body.
-                text=chunk.retrieval_text or chunk.text,
+                text=chunk.search_text,
             )
             for chunk in ordered_chunks
         )

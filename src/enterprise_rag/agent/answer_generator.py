@@ -5,6 +5,7 @@ English: Generate an answer solely from the final bounded evidence bundle.
 
 from __future__ import annotations
 
+from enterprise_rag.agent.model_invocation import complete_with_timeout
 from enterprise_rag.agent.prompts import ANSWER_SYSTEM_PROMPT
 from enterprise_rag.domain.protocols.models import LLMProvider, ModelResponse
 from enterprise_rag.retrieval.models import EvidenceBundle
@@ -26,7 +27,12 @@ class AnswerGenerator:
         # English: One provider instance is reused by application dependency wiring.
         self._provider = provider
 
-    def generate(self, query: str, evidence: EvidenceBundle) -> ModelResponse:
+    def generate(
+        self,
+        query: str,
+        evidence: EvidenceBundle,
+        timeout_seconds: float | None = None,
+    ) -> ModelResponse:
         """中文：该函数或方法负责“生成”相关处理。
 
         English: Return an unverified answer draft and provider usage.
@@ -40,8 +46,10 @@ class AnswerGenerator:
             f"Authorized evidence from index {evidence.index_version_id}:\n"
             f"{evidence.context_text}"
         )
-        return self._provider.complete(
+        return complete_with_timeout(
+            self._provider,
             ANSWER_SYSTEM_PROMPT,
             user_prompt,
-            metadata={"operation": "answer_generation"},
+            {"operation": "answer_generation"},
+            timeout_seconds,
         )

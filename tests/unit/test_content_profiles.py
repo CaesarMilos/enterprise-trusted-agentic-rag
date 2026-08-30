@@ -149,7 +149,7 @@ def test_technical_strategy_identifies_api_and_configuration_units() -> None:
     unit_types = {unit_type for chunk in chunks for unit_type in chunk.metadata["unit_types"]}
     assert "api_section" in unit_types
     assert "config" in unit_types
-    assert all(chunk.chunker_version == "technical-document-v2" for chunk in chunks)
+    assert all(chunk.chunker_version == "technical-document-v4" for chunk in chunks)
 
 
 def test_scanned_pdf_is_routed_to_needs_ocr(tmp_path: Path) -> None:

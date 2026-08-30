@@ -1,48 +1,63 @@
-# V0.3.0rc2 实现与验证状态
+# V4 实现与验证状态
 
-## 本轮已完成
+本文件只记录当前源码中可以核对的事实，不把缺少外部运行时的项目写成已完成。
 
-- 文档撤销边界：在旧活动索引返回 Chunk ID 后，数据库再校验 `READY`、`active_version_id` 和资料源活动状态。
-- Worker 心跳与 fencing：长时间 OCR、Embedding 和索引构建期间续租；所有持久化和发布副作用校验 `lease_owner + attempt_count + expires_at`。
-- 索引发布：同租户激活事务通过租户行串行化，再完成预期活动版本 CAS。
-- LLM 预算：真实请求前计数，坏 JSON、HTTP 异常与提供方失败都不能绕过每文档上限。
-- 确定性回退：Embedding 异常改用本地词频余弦；LLM 异常/坏 JSON/预算耗尽改用目标长度压力。
-- 上传安全：Nginx + ASGI 完整请求体上限 + 端点单文件上限三层防护。
-- OCR 部署：Docker 包含 PyMuPDF、Pillow、pytesseract、Tesseract `chi_sim+eng` 和 CJK 字体。
-- 删除了仍指向 `0.1.0`/DOCX 依赖的过期 `uv.lock`；当前候选版以 `pyproject.toml` 为依赖真值，待可联网的发布环境重新生成锁文件。
-- 保留 V0.3 原有 PDF Reflow、内容画像、父子 Chunk、中文锚点、混合检索、Agent 问答和局部引用能力。
+## 已实现：生产可信化
 
-## 本执行环境已验证
+- `lifecycle_generation` 删除 fencing、删除请求/完成时间和不可逆删除状态。
+- 任务 generation 快照、取消请求/原因、租约、attempt token、心跳和失效 Worker 写入阻断。
+- 文档、任务、索引显式状态机；Worker 异常不会覆盖删除状态。
+- 统一候选索引构建、Manifest 校验、重新加载验证、租户级 CAS 激活、失败状态收口和旧活动版本保留。
+- Agent 单调时钟硬截止；检索、改写、回答和引用校验前后检查，模型子调用接收剩余预算。
+- `demo`、`jwt`、`trusted_proxy` 互斥认证；生产 Demo 禁用和密钥缺失 fail-closed。
+- JWT HS256 的签名、时效、issuer、audience、用户和租户声明验证。
+- JWT 模式忽略客户端伪造身份头；可信代理模式要求共享密钥；Nginx 清洗身份头。
+- 开发/生产 Compose 分离、API 内网暴露、非 root 容器、只读根文件系统和依赖锁。
+- SQLite 启动时幂等补充 V4 生命周期、任务取消、版本策略和索引状态列。
+
+## 已实现：自适应中文 RAG
+
+- PDF/Markdown/TXT 统一 Loader、PDF 逐页质量检测与可插拔 Tesseract OCR。
+- 六种内容画像和低置信度通用回退。
+- 标题、章/节/条/款/项、步骤、警告、参数、API、代码、表格和自然段结构识别。
+- 保护 URL、小数、版本号、括号和引号的中文句子安全切分。
+- 五特征自适应边界公式、动态长度阈值、批量 Embedding、缓冲区质心连续性和完整边界 Trace。
+- 硬边界优先；LLM 仅复核模糊分数带，且有单文档预算与确定性失败回退。
+- 过长单元安全切分、同父结构短块合并、只写入检索文本的完整句重叠。
+- 稳定 Child/Parent ID、双向关系、Child-only 建索引、Parent 预算扩展和 Child 精确引用。
+- 中文字符/二元词组/英文词/条款锚点 BM25、向量召回、RRF、重排和故障降级。
+- 动态 Top-K 的分数断层、Parent 去重、单文档占比与上下文 Token 预算。
+- Query Rewrite 次数/模型/Token/时间预算，以及引用存在性、ACL、版本和基础支持校验。
+- 空/超长/重复/碎片/页码/父子关系质量门和固定评测报告比较工具。
+
+## 当前自动验证结果
+
+在当前工作区运行：
 
 ```text
-Python compileall: src / scripts / tests 全部通过
-双语注释审计: 本轮修改/新增 Python 文件的模块、类、函数全部通过
-100 字符行长审计: src / tests 通过
-YAML 解析: default / development / docker-compose 通过
-纯 Python 反例: LLM 正常上限、坏 JSON 上限、Embedding 异常回退、民法典条款、Markdown 标题、父子 Chunk 通过
+ruff check src tests scripts       PASS
+mypy src                           PASS（135 个源码文件）
+pytest -q                          PASS（62 passed, 2 skipped）
+uv pip check                       PASS（65 个已安装包兼容）
+uv lock --check                    PASS
+中英双语文档字符串审计             PASS（0 缺失、0 非双语）
 ```
 
-## 必须在目标 py311 环境复验
+自动测试覆盖配置、稳定 ID、内容画像、结构/语义边界、LLM 预算回退、Parent-Child、中文检索、Agent 预算、JWT/可信代理、租户范围、SQLite 持久化、删除 generation 竞态、索引状态和 HTTP 上传边界。
 
-当前容器没有 SQLAlchemy、FastAPI、Pytest、Ruff、MyPy、FAISS 和 OCR 系统依赖，因此不宣称下列门禁已在本容器通过：
+## 当前环境未执行
 
-```bash
-python -m pip install -e ".[dev,local-models,ocr]"
-python -m pytest
-python -m ruff check src tests scripts
-python -m mypy src
-python -m pip check
-docker compose config
-docker compose build
-```
+- 真实 FAISS + FastAPI + Worker 端到端测试：缺少 `faiss`，测试明确跳过。
+- 真实中文 OCR 集成测试：缺少 `PyMuPDF/fitz`，测试明确跳过。
+- Docker 构建与 Compose 冒烟：当前执行环境没有 Docker 命令。
+- 真实 Ollama/Qwen、目标 Embedding 和 Cross-Encoder 回归：需要目标模型服务与模型缓存。
+- 固定企业中文黄金集的候选/基线指标：需要项目方提供或完成授权语料标注。
 
-高优先级实机验收顺序：
+这些项目是生产发布的阻断项，而不是代码单元门禁失败。应在具备对应运行时和真实评测数据的目标环境执行 `docs/DEPLOYMENT.md` 与 `docs/EVALUATION.md` 中的验收步骤。
 
-1. `tests/integration/test_persistence.py`：撤销边界与过期索引计划。
-2. `tests/integration/test_worker_fencing.py`：租约续期、重领、旧 Worker 写入/激活拒绝。
-3. `tests/integration/test_request_body_limit.py`：FastAPI multipart 413 与正常上传。
-4. `tests/integration/test_real_ocr.py`：存在 Tesseract 时运行真实图像 PDF OCR。
-5. `tests/e2e/test_agentic_rag_flow.py`：真实 API + Worker + FAISS/BM25 + Chat 闭环。
-6. 删除后旧索引、服务重启和 Docker 网关/OCR 的部署级验收。
+## 残余生产风险
 
-只有上述完整门禁在目标环境全部绿色，才能将 `0.3.0rc2` 发布为 `0.3.0`。
+- 当前持久化基线是单机 SQLite 和本地不可变索引；多主机部署需要支持分布式锁/CAS 的数据库和共享对象存储适配器。
+- Docker 基础镜像已固定补丁版本，但生产供应链仍应使用组织批准的镜像 digest 和 Debian 包快照。
+- HS256 适合受控单体部署；跨服务身份平台建议增加 OIDC/JWKS 非对称签名适配器和密钥轮换。
+- 规则与默认权重已经可配置和版本化，但最终阈值必须由固定中文黄金集调优，不能以默认值代替业务验收。

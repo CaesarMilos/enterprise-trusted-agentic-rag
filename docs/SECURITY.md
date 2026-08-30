@@ -1,68 +1,55 @@
-# 安全设计
+# V4 安全设计
 
 ## 信任边界
 
-- `UserContext` 来自认证依赖，不接受请求正文中的 `tenant_id` 或角色。
-- 所有 Repository 查询显式包含 `tenant_id`。
-- `RetrievalScope` 在 Source Router、Dense 和 BM25 搜索前固定。
-- 请求指定 Source 时，只能缩小授权范围，不能扩大范围。
-- CitationVerifier 在答案返回前再次检查 Tenant、Source 和 Document。
+外部客户端只连接网关。网关删除客户端提供的用户、租户、角色、Source、用户组和代理密钥头，再转发到内部 API。API 只根据经过密码学验证的 JWT，或经过共享密钥验证的可信代理身份构造 `UserContext`。
 
-## 生产身份适配
+## 认证模式
 
-- 开发环境可显式开启 `demo_auth_enabled`，生产环境配置校验会拒绝该模式；
-- 生产环境可开启 `trusted_proxy_auth_enabled`，由企业网关/SSO 反向代理传递用户、租户、角色、资料源和用户组；
-- 应用使用 `X-Auth-Proxy-Secret` 与环境变量 `ENTERPRISE_RAG_PROXY_SECRET` 做恒定时间校验；
-- 反向代理必须删除所有来自外部客户端的 `X-User-ID`、`X-Tenant-ID`、`X-Roles`、`X-Source-IDs`、`X-Group-IDs` 和 `X-Auth-Proxy-Secret`，再根据已验证会话重新写入；
-- 应用端口不得绕过反向代理直接暴露；共享密钥应由密钥管理系统注入并定期轮换；
-- 未启用 Demo 或可信代理时，系统安全返回 `401`，不会构造伪身份。
+三种模式互斥：
 
-Production identity is supplied either by explicit non-production demo mode or by a trusted
-enterprise reverse proxy. The proxy must strip every inbound identity header, authenticate the
-session, inject verified identity values, and keep the application port private. A shared secret
-is compared in constant time; it is never persisted in application configuration or traces.
+- `demo`：仅开发配置；生产环境选择它会拒绝启动。
+- `jwt`：生产默认；验证 HS256、签名、`exp`、`nbf`、`iss`、`aud`、`sub` 和 `tenant_id`。
+- `trusted_proxy`：只允许位于受控代理之后；请求必须携带进程环境中的共享密钥。
 
-## 文件安全
+JWT 密钥读取自 `ENTERPRISE_RAG_JWT_SECRET`。代理密钥读取自 `ENTERPRISE_RAG_PROXY_SECRET`。密钥不得进入 YAML、镜像、Trace、日志或错误响应。
 
-- 丢弃上传文件携带的父目录；
-- 二进制 PDF 检查 Magic Bytes；
-- 限制文件类型、大小和空文件；
-- 原文件路径由 `tenant_id/version_id` 派生，不使用原始文件名作为路径；
-- 每个路径段单独校验，并对解析结果执行 Root Containment；
-- 先写同目录临时文件、`fsync`，再 `os.replace` 原子发布；
-- 记录 SHA-256；
-- 删除只针对已解析、已验证的确切目标。
+## 授权与租户隔离
 
-## 撤销与并发安全
+所有文档、版本、Chunk、任务、索引和 Trace 都带 `tenant_id`。Repository 查询显式包含租户条件；在线检索还必须把请求 Source 范围与用户允许范围求交集。Source Router 只在授权候选内工作，不能扩大 ACL。
 
-- 文档进入 `PENDING_DELETE`、非 `READY` 或资料源停用后，候选 Chunk ID 必须经过数据库最终生命周期再校验；
-- 删除索引重建失败时保持 `PENDING_DELETE`，旧索引也无法继续加载该文档正文；
-- 每次任务领取递增 `attempt_count`，与 `lease_owner` 和到期时间共同作为 fencing token；
-- 失租 Worker 不得替换 Chunk、写质量指标、改终态或激活索引；
-- 同一租户的索引激活串行化并验证预期活动版本。
+管理员只在当前租户内拥有重建索引、修改画像和查看租户 Trace 的权限。`requested_source_ids` 只是进一步收窄，不是授权声明。
 
-## 请求体限制
+## 文件和解析安全
 
-- Nginx 在请求进入 ASGI 前实施第一层上限；
-- ASGI middleware 在 Starlette/FastAPI 解析 multipart 与创建 `UploadFile` 前执行 `Content-Length` 预检和真实流式计数；
-- 端点再按单文件分块计数，并在失败时删除精确临时文件。
+- ASGI 中间件在 multipart 解析前限制总请求体；端点再限制单文件字节数。
+- 后缀、MIME 和文件签名联合校验，原文件路径由服务端稳定 ID 生成。
+- 租户目录隔离、路径穿越防护、临时文件清理、原子移动和 SHA-256 校验。
+- PDF/OCR/文本异常转换为稳定错误，不把原文或内部路径暴露给客户端。
 
-## Prompt Injection
+## 生命周期与索引安全
 
-ContextBuilder 把所有检索正文放进 `<UNTRUSTED_DOCUMENT>` 标签，并明确声明正文仅为数据。系统 Prompt 禁止执行正文中的指令。引用验证与 ACL 不依赖模型判断。
+删除请求递增 `lifecycle_generation`，使旧任务的快照立即失效。Worker 的租约、attempt token、取消状态和 generation 共同组成 fencing。活动索引发布使用 CAS；请求固定一个索引快照，避免问答过程中读到半发布状态。
 
-## 日志与 Trace
+## 模型与提示词安全
 
-默认不保存 API Key、Authorization、权限 Token、完整 Prompt、模型原始响应和 Chunk 全文。Trace 属性过滤潜在密钥字段，并限制字符串和集合大小。Trace 写入失败不影响正常问答。
+- 模型只收到调用者授权的 Evidence Pack。
+- Query Rewrite 不得改变原始权限范围，最多执行配置次数。
+- 回答必须引用当前快照的真实 Child；引用校验失败则拒答。
+- LLM 边界复核只接收相邻局部单元，只在模糊分数带触发并受单文档调用上限约束。
+- Trace 记录指纹、计数和原因，不记录 API Key。
 
-## 已覆盖测试
+## 容器基线
 
-- 跨租户 Document 查询不可见；
-- `PENDING_DELETE` 立即从活动 Chunk 查询消失；
-- `PENDING_DELETE` 在旧活动索引返回 ID 后仍无法加载 Chunk；
-- 租约过期并重领后，旧 Worker 无法写 Chunk、终态或激活索引；
-- 超限 multipart 请求在解析边界返回稳定 413；
-- FileStore 路径穿越被拒绝；
-- BM25 在返回 Chunk ID 前执行 Scope 过滤；
-- 生产配置拒绝 Demo 认证；
-- CitationVerifier 重新检查 ACL。
+运行用户固定为 UID/GID `10001`；文件系统只读，仅数据卷、模型缓存和 `/tmp` 可写；容器删除 Linux capabilities 并启用 `no-new-privileges`。API 在生产 Compose 中不映射主机端口，只有 Nginx 网关公开。
+
+## 发布前安全测试
+
+- 伪造 `X-Roles: admin` 和 `X-Tenant-Id` 无效。
+- JWT 错误签名、错误 issuer/audience、过期和未生效令牌被拒绝。
+- 跨租户 Source、文档、索引和 Trace 不可见。
+- 删除与 Worker 并发时旧任务无法写回或发布。
+- 上传超限、路径穿越、错误签名文件被拒绝。
+- 生产环境缺少认证密钥时进程在监听端口前失败。
+
+本工程提供应用级安全边界，但生产部署仍需 TLS、密钥轮换、镜像扫描、依赖漏洞扫描、数据库备份、日志留存和基础设施访问控制。

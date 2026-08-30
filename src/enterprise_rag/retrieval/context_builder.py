@@ -32,6 +32,7 @@ class ContextBuilder:
         routing: RoutingResult,
         top_k: TopKDecision,
         degradations: tuple[str, ...] = (),
+        expanded_contexts: Mapping[str, Chunk] | None = None,
     ) -> EvidenceBundle:
         """中文：该函数或方法负责“构建目标对象”相关处理。
 
@@ -40,11 +41,13 @@ class ContextBuilder:
 
         # 中文：变量 `items` 用于保存“`items`”相关数据；其精确定义与约束见下方英文说明。
         # English: Evidence labels are stable within the final selected order.
+        context_mapping = expanded_contexts or {}
         items = tuple(
             EvidenceItem(
                 citation_id=f"C{position}",
                 chunk=chunks[candidate.chunk_id],
                 score=candidate.score,
+                context_chunk=context_mapping.get(candidate.chunk_id),
             )
             for position, candidate in enumerate(candidates, start=1)
             if candidate.chunk_id in chunks
@@ -91,6 +94,6 @@ class ContextBuilder:
             f"version_id={item.chunk.document_version_id} "
             f"page={page_label} heading={heading_label}\n"
             "<UNTRUSTED_DOCUMENT>\n"
-            f"{item.chunk.text}\n"
+            f"{(item.context_chunk or item.chunk).text}\n"
             "</UNTRUSTED_DOCUMENT>"
         )

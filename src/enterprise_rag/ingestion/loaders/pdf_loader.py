@@ -159,7 +159,7 @@ class PDFLoader:
                     )
                 merged_blocks = tuple(
                     ocr_by_page[block.page_number]
-                    if block.page_number in missing_pages
+                    if block.page_number is not None and block.page_number in missing_pages
                     else block
                     for block in blocks
                 )

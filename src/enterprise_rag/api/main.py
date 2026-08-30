@@ -6,7 +6,6 @@ application factory.
 
 from enterprise_rag.api.application import create_app
 
-
 # 中文：关键变量 `app` 是 Uvicorn 导入的单一进程级应用实例。
 # English: Key variable `app` is the conventional process-wide instance imported by Uvicorn.
 app = create_app()

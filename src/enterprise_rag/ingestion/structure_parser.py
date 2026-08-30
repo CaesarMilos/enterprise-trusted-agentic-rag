@@ -8,12 +8,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from enterprise_rag.ingestion.chunking.chinese_sentence_splitter import ChineseSentenceSplitter
 from enterprise_rag.ingestion.cleaner import CleanedDocument
 
-# 中文：变量 `_SENTENCE_BOUNDARY` 用于保存“`sentence``boundary`”相关数据；
-# 其精确定义与约束见下方英文说明。
-# English: Sentence boundaries support common Chinese and Latin terminal punctuation.
-_SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？!?；;])\s*|(?<=[.])\s+(?=[A-Z0-9])")
+# 中文：无状态切句器在所有格式解析器间复用，确保相同文本得到相同句界。
+# English: One stateless splitter keeps sentence boundaries identical across file formats.
+_SENTENCE_SPLITTER = ChineseSentenceSplitter()
 # 中文：变量 `_TOKEN_PATTERN` 用于保存“词元`pattern`”相关数据；
 # 其精确定义与约束见下方英文说明。
 # English: Token estimate counts CJK characters, Latin words, and standalone punctuation.
@@ -36,9 +36,7 @@ def _split_prose(text: str) -> tuple[str, ...]:
     # 中文：变量 `lines` 让条目编号、警告和配置行能够被专用策略单独识别。
     # English: Lines expose numbered steps, warnings, and configuration entries to strategies.
     lines = tuple(line.strip() for line in text.splitlines() if line.strip()) or (text.strip(),)
-    return tuple(
-        part.strip() for line in lines for part in _SENTENCE_BOUNDARY.split(line) if part.strip()
-    )
+    return tuple(part for line in lines for part in _SENTENCE_SPLITTER.split(line))
 
 
 def estimate_tokens(text: str) -> int:

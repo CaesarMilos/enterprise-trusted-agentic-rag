@@ -5,6 +5,7 @@ English: Select an explainable evidence count from score gaps, diversity, and to
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 from enterprise_rag.domain.models import Chunk
@@ -24,6 +25,7 @@ class DynamicTopK:
         max_k: int,
         token_budget: int,
         score_gap_ratio: float = 0.35,
+        max_document_share: float = 0.6,
     ) -> None:
         """中文：初始化当前实例，并保存后续操作所需的依赖、配置或状态。
 
@@ -49,6 +51,11 @@ class DynamicTopK:
         # 其精确定义与约束见下方英文说明。
         # English: Relative consecutive score drop considered a meaningful boundary.
         self._score_gap_ratio = score_gap_ratio
+        if not 0.0 < max_document_share <= 1.0:
+            raise ValueError("max_document_share must be within (0, 1]")
+        # 中文：单文档证据占比防止长文档垄断最终上下文。
+        # English: Per-document share prevents one long document monopolizing context.
+        self._max_document_share = max_document_share
 
     def select(
         self,
@@ -122,7 +129,7 @@ class DynamicTopK:
             # English: At most half the target may come from one document when
             #   alternatives exist.
             document_limit = (
-                max(1, (target + 1) // 2)
+                max(1, math.ceil(target * self._max_document_share))
                 if len(available_document_ids) > 1
                 else target
             )

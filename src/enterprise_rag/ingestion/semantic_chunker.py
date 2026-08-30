@@ -7,7 +7,7 @@ chunks.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from enterprise_rag.core.ids import content_sha256, stable_chunk_id
 from enterprise_rag.domain.models import Chunk
@@ -74,6 +74,10 @@ class _ChunkDraft:
     section_number: str | None
     source_start_offset: int
     source_end_offset: int
+    boundary_score: float | None = None
+    boundary_threshold: float | None = None
+    boundary_features: dict[str, float] | None = None
+    overlap_text: str = ""
     chunk_level: str = "leaf"
     child_leaf_indexes: tuple[int, ...] = ()
 
@@ -152,9 +156,15 @@ class DynamicSemanticChunker:
         bounded_units = tuple(
             split_unit for unit in units for split_unit in self._split_oversized_unit(unit)
         )
+        # 中文：向量在循环前按文档批量生成并缓存，候选边界不再逐次调用提供方。
+        # English: Vectors are batch-generated and cached before candidate-boundary iteration.
+        self._boundary_analyzer.prepare(bounded_units)
         leaf_drafts: list[_ChunkDraft] = []
         buffer: list[StructuredUnit] = []
         buffer_tokens = 0
+        # 中文：累积当前块内部发生的所有降级原因，避免 document_end 覆盖审计信息。
+        # English: Accumulate in-chunk degradations so document_end cannot erase audit evidence.
+        pending_fallbacks: list[str] = []
         # 中文：关键变量 `review_budget` 在真实请求前计数，坏 JSON 与异常无法绕过上限。
         # English: Key variable `review_budget` counts before provider calls, so invalid JSON
         # and failures cannot bypass the cap.
@@ -166,10 +176,21 @@ class DynamicSemanticChunker:
                 unit,
                 review_budget=review_budget,
             )
+            if decision.fallback_reason and decision.fallback_reason not in pending_fallbacks:
+                pending_fallbacks.append(decision.fallback_reason)
             if buffer and decision.should_split:
-                leaf_drafts.append(self._draft(buffer, decision))
+                leaf_drafts.append(
+                    self._draft(
+                        buffer,
+                        replace(
+                            decision,
+                            fallback_reason=",".join(pending_fallbacks) or None,
+                        ),
+                    )
+                )
                 buffer = []
                 buffer_tokens = 0
+                pending_fallbacks = []
             buffer.append(unit)
             buffer_tokens += unit.token_count
         if buffer:
@@ -180,10 +201,17 @@ class DynamicSemanticChunker:
                         True,
                         "document_end",
                         1.0,
+                        fallback_reason=",".join(pending_fallbacks) or None,
                         llm_calls_used=review_budget.used_calls,
                     ),
                 )
             )
+
+        # 中文：后处理只在同一父结构内合并微块，并以完整句子补充检索重叠。
+        # English: Post-processing merges micro-chunks only within one parent and adds
+        # sentence overlap.
+        leaf_drafts = self._merge_short_drafts(leaf_drafts)
+        leaf_drafts = self._apply_adaptive_overlap(leaf_drafts)
 
         parent_drafts = (
             self._build_parent_drafts(leaf_drafts) if self._create_parent_chunks else []
@@ -261,10 +289,130 @@ class DynamicSemanticChunker:
                         "llm_calls_used": draft.llm_calls_used,
                         "fallback_reason": draft.fallback_reason,
                         "boundary_similarity": draft.similarity,
+                        "boundary_score": draft.boundary_score,
+                        "boundary_threshold": draft.boundary_threshold,
+                        "boundary_features": draft.boundary_features or {},
+                        "overlap_text": draft.overlap_text,
                     },
                 )
             )
         return tuple(chunks)
+
+    def _merge_short_drafts(self, drafts: list[_ChunkDraft]) -> list[_ChunkDraft]:
+        """中文：把过短块向右吸附；硬边界、父结构或角色不一致时保持独立。
+
+        English: Attach short chunks rightward unless a hard boundary, parent, or role differs.
+        """
+
+        merged: list[_ChunkDraft] = []
+        index = 0
+        while index < len(drafts):
+            current = drafts[index]
+            if (
+                current.token_count < self._min_tokens
+                and index + 1 < len(drafts)
+                and self._can_merge(current, drafts[index + 1])
+            ):
+                merged.append(self._merge_pair(current, drafts[index + 1]))
+                index += 2
+                continue
+            if (
+                current.token_count < self._min_tokens
+                and merged
+                and self._can_merge(merged[-1], current)
+            ):
+                merged[-1] = self._merge_pair(merged[-1], current)
+            else:
+                merged.append(current)
+            index += 1
+        return merged
+
+    def _can_merge(self, left: _ChunkDraft, right: _ChunkDraft) -> bool:
+        """中文：验证合并不会越过硬结构边界且不会超过 Token 硬上限。
+
+        English: Verify merging crosses no hard boundary and remains below the token maximum.
+        """
+
+        hard_methods = {"structural_boundary", "heading_change", "max_tokens"}
+        protected_roles = {"warning", "table", "code", "api_section"}
+        left_roles = set(left.unit_types) & protected_roles
+        right_roles = set(right.unit_types) & protected_roles
+        return (
+            left.boundary_method not in hard_methods
+            and left.parent_key == right.parent_key
+            and (not left_roles and not right_roles or left_roles == right_roles)
+            and left.token_count + right.token_count <= self._max_tokens
+        )
+
+    @staticmethod
+    def _merge_pair(left: _ChunkDraft, right: _ChunkDraft) -> _ChunkDraft:
+        """中文：确定性拼接相邻草稿并继承右侧最终边界审计信息。
+
+        English: Deterministically join adjacent drafts and inherit the right terminal boundary.
+        """
+
+        start_pages = [page for page in (left.page_start, right.page_start) if page is not None]
+        end_pages = [page for page in (left.page_end, right.page_end) if page is not None]
+        text = f"{left.text}\n\n{right.text}"
+        return _ChunkDraft(
+            text=text,
+            retrieval_text=f"{left.retrieval_text}\n\n{right.retrieval_text}",
+            token_count=estimate_tokens(text),
+            page_start=min(start_pages) if start_pages else None,
+            page_end=max(end_pages) if end_pages else None,
+            heading_path=right.heading_path or left.heading_path,
+            boundary_reason="short_chunk_merge",
+            boundary_method=right.boundary_method,
+            boundary_confidence=right.boundary_confidence,
+            llm_attempted=left.llm_attempted or right.llm_attempted,
+            fallback_reason=right.fallback_reason or left.fallback_reason,
+            similarity=right.similarity,
+            llm_calls_used=max(left.llm_calls_used, right.llm_calls_used),
+            unit_types=tuple(dict.fromkeys((*left.unit_types, *right.unit_types))),
+            section_number=right.section_number or left.section_number,
+            source_start_offset=min(left.source_start_offset, right.source_start_offset),
+            source_end_offset=max(left.source_end_offset, right.source_end_offset),
+            boundary_score=right.boundary_score,
+            boundary_threshold=right.boundary_threshold,
+            boundary_features=right.boundary_features,
+        )
+
+    @staticmethod
+    def _apply_adaptive_overlap(drafts: list[_ChunkDraft]) -> list[_ChunkDraft]:
+        """中文：正文不重复，仅向下一块检索文本加入同父结构的上一完整句。
+
+        English: Keep body text unique and add one prior complete sentence only to search text.
+        """
+
+        if len(drafts) < 2:
+            return drafts
+        result = [drafts[0]]
+        for previous, current in zip(drafts, drafts[1:], strict=False):
+            overlap = ""
+            if (
+                previous.parent_key == current.parent_key
+                and previous.section_number == current.section_number
+                and previous.boundary_method
+                not in {"structural_boundary", "heading_change", "max_tokens"}
+            ):
+                sentences = tuple(
+                    part.strip()
+                    for part in re.split(r"(?<=[。！？!?；;])", previous.text)
+                    if part.strip()
+                )
+                overlap = (sentences[-1] if sentences else previous.text)[-180:]
+            result.append(
+                replace(
+                    current,
+                    retrieval_text=(
+                        f"上下文 / Previous context: {overlap}\n{current.retrieval_text}"
+                        if overlap
+                        else current.retrieval_text
+                    ),
+                    overlap_text=overlap,
+                )
+            )
+        return result
 
     def _split_oversized_unit(self, unit: StructuredUnit) -> tuple[StructuredUnit, ...]:
         """中文：按原文跨度拆分超大单元，同时保留编号、标题、页码与位置元数据。
@@ -358,6 +506,9 @@ class DynamicSemanticChunker:
             section_number=section_number,
             source_start_offset=min(unit.source_start_offset for unit in units),
             source_end_offset=max(unit.source_end_offset for unit in units),
+            boundary_score=decision.score,
+            boundary_threshold=decision.threshold,
+            boundary_features=decision.features,
         )
 
     def _build_parent_drafts(self, leaves: list[_ChunkDraft]) -> list[_ChunkDraft]:

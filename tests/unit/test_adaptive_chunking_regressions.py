@@ -1,6 +1,6 @@
-"""中文：验证 V0.3 PDF 恢复、自适应层级切块、中文锚点和检索安全回退。
+"""中文：验证 V4 PDF 恢复、自适应层级切块、中文锚点和检索安全回退。
 
-English: Verify V0.3 PDF reflow, adaptive hierarchy, Chinese anchors, and safe retrieval
+English: Verify V4 PDF reflow, adaptive hierarchy, Chinese anchors, and safe retrieval
 fallbacks.
 """
 
@@ -19,12 +19,13 @@ from enterprise_rag.ingestion.boundary_analyzer import (
     BoundaryReviewBudget,
 )
 from enterprise_rag.ingestion.chunk_strategies import build_default_strategy_registry
+from enterprise_rag.ingestion.chunking.boundary_scorer import BoundaryWeights
 from enterprise_rag.ingestion.cleaner import TextCleaner
 from enterprise_rag.ingestion.loaders.base import LoadedDocument, RawBlock
 from enterprise_rag.ingestion.semantic_chunker import ChunkingContext, DynamicSemanticChunker
 from enterprise_rag.ingestion.structure_parser import (
-    StructureParser,
     StructuredUnit,
+    StructureParser,
     estimate_tokens,
 )
 from enterprise_rag.retrieval.dynamic_top_k import DynamicTopK
@@ -184,6 +185,14 @@ def test_llm_boundary_reviews_are_bounded_per_document() -> None:
         hard_boundary_kinds=frozenset(),
         similarity_provider=_AmbiguousSimilarity(),
         llm_judge=judge,  # type: ignore[arg-type]
+        base_boundary_threshold=0.24,
+        boundary_weights=BoundaryWeights(
+            structure=0.0,
+            semantic_gap=1.0,
+            length_pressure=0.0,
+            marker_change=0.0,
+            role_change=0.0,
+        ),
     )
     chunker = DynamicSemanticChunker(
         1,
@@ -216,6 +225,14 @@ def test_invalid_llm_results_still_consume_the_document_budget() -> None:
         hard_boundary_kinds=frozenset(),
         similarity_provider=_AmbiguousSimilarity(),
         llm_judge=judge,  # type: ignore[arg-type]
+        base_boundary_threshold=0.24,
+        boundary_weights=BoundaryWeights(
+            structure=0.0,
+            semantic_gap=1.0,
+            length_pressure=0.0,
+            marker_change=0.0,
+            role_change=0.0,
+        ),
     )
     chunker = DynamicSemanticChunker(
         1,
@@ -231,7 +248,7 @@ def test_invalid_llm_results_still_consume_the_document_budget() -> None:
     chunks = chunker.chunk(units, _context())
 
     assert judge.calls == 2
-    assert any(chunk.metadata["fallback_reason"] == "llm_invalid_json" for chunk in chunks)
+    assert any("llm_invalid_json" in chunk.metadata["fallback_reason"] for chunk in chunks)
     assert max(int(chunk.metadata["llm_calls_used"]) for chunk in chunks) == 2
 
 
@@ -256,7 +273,8 @@ def test_similarity_provider_failure_uses_lexical_fallback() -> None:
     )
 
     assert decision.fallback_reason == "embedding_provider_error"
-    assert decision.method.startswith("lexical_fallback_")
+    assert decision.method.startswith("adaptive_score_")
+    assert decision.features is not None
 
 
 def test_civil_code_pdf_reflow_keeps_clause_and_subitems_together() -> None:

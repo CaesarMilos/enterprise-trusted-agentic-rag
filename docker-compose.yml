@@ -1,65 +1,65 @@
-# 中文：启动 API、持久化资料接入工作进程，以及仅通过 HTTP 通信的 Streamlit 客户端。
-# English: Run the API, durable ingestion worker, and HTTP-only Streamlit client.
+# 中文：V4 生产编排默认使用 JWT；API 只在内部网络暴露，外部入口仅为安全网关。
+# English: V4 production defaults to JWT; only the gateway is public and the API stays internal.
 services:
   gateway:
-    image: nginx:1.27-alpine
+    image: nginx:1.27.5-alpine
     volumes:
       - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
       - "8000:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, CHOWN, SETGID, SETUID]
     restart: unless-stopped
 
   api:
     build: .
-    environment:
-      ENTERPRISE_RAG_ENV: development
+    environment: &production_environment
+      ENTERPRISE_RAG_ENV: production
+      ENTERPRISE_RAG__SECURITY__AUTHENTICATION_MODE: jwt
+      ENTERPRISE_RAG__SECURITY__DEMO_AUTH_ENABLED: "false"
+      ENTERPRISE_RAG__SECURITY__TRUSTED_PROXY_AUTH_ENABLED: "false"
+      ENTERPRISE_RAG_JWT_SECRET: ${ENTERPRISE_RAG_JWT_SECRET:?set ENTERPRISE_RAG_JWT_SECRET}
       LLM_API_KEY: ${LLM_API_KEY:-}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      ENTERPRISE_RAG__INGESTION__MAX_REQUEST_BODY_SIZE_MB: ${ENTERPRISE_RAG__INGESTION__MAX_REQUEST_BODY_SIZE_MB:-55}
-      ENTERPRISE_RAG__SECURITY__TRUSTED_PROXY_AUTH_ENABLED: ${ENTERPRISE_RAG__SECURITY__TRUSTED_PROXY_AUTH_ENABLED:-false}
-      ENTERPRISE_RAG_PROXY_SECRET: ${ENTERPRISE_RAG_PROXY_SECRET:-}
-    expose:
-      - "8000"
+      ENTERPRISE_RAG__OCR__ENABLED: ${ENTERPRISE_RAG__OCR__ENABLED:-false}
+    expose: ["8000"]
     volumes:
       - enterprise_data:/app/data
-      - model_cache:/root/.cache
+      - model_cache:/app/.cache
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
     restart: unless-stopped
 
   worker:
     build: .
     command: ["python", "scripts/run_worker.py"]
     environment:
-      ENTERPRISE_RAG_ENV: development
-      LLM_API_KEY: ${LLM_API_KEY:-}
-      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      <<: *production_environment
       ENTERPRISE_RAG__INGESTION__JOB_LEASE_SECONDS: ${ENTERPRISE_RAG__INGESTION__JOB_LEASE_SECONDS:-300}
       ENTERPRISE_RAG__INGESTION__JOB_HEARTBEAT_SECONDS: ${ENTERPRISE_RAG__INGESTION__JOB_HEARTBEAT_SECONDS:-60}
       ENTERPRISE_RAG__INGESTION__LLM_BOUNDARY_ENABLED: ${ENTERPRISE_RAG__INGESTION__LLM_BOUNDARY_ENABLED:-false}
-      ENTERPRISE_RAG__INGESTION__LLM_BOUNDARY_MAX_CALLS: ${ENTERPRISE_RAG__INGESTION__LLM_BOUNDARY_MAX_CALLS:-8}
-      ENTERPRISE_RAG__OCR__ENABLED: ${ENTERPRISE_RAG__OCR__ENABLED:-false}
     volumes:
       - enterprise_data:/app/data
-      - model_cache:/root/.cache
+      - model_cache:/app/.cache
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
     depends_on:
-      - api
-    restart: unless-stopped
-
-  ui:
-    build: .
-    command:
-      - streamlit
-      - run
-      - src/enterprise_rag/ui/streamlit_app.py
-      - --server.address=0.0.0.0
-      - --server.port=8501
-    environment:
-      ENTERPRISE_RAG_API_URL: http://api:8000/api/v1
-    ports:
-      - "8501:8501"
-    depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

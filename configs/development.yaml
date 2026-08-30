@@ -4,7 +4,9 @@ application:
   debug: true
 
 security:
+  authentication_mode: demo
   demo_auth_enabled: true
+  trusted_proxy_auth_enabled: false
 
 llm:
   model: qwen3:8b

@@ -106,6 +106,12 @@ class TopKDecision:
     # 其精确定义与约束见下方英文说明。
     # English: Chunk IDs removed by deduplication or budget enforcement.
     dropped_chunk_ids: tuple[str, ...] = ()
+    # 中文：按预算实际展开的 Parent ID，用于 Trace 解释证据上下文来源。
+    # English: Parent IDs actually expanded within budget for trace explainability.
+    expanded_parent_chunk_ids: tuple[str, ...] = ()
+    # 中文：最终 Evidence Pack 的估算 Token 数，而非仅 Child 选择阶段的数量。
+    # English: Estimated final Evidence Pack tokens after parent expansion.
+    final_context_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +130,9 @@ class EvidenceItem:
     # 中文：变量 `score` 用于保存“计算相关性分数”相关数据；其精确定义与约束见下方英文说明。
     # English: Final retrieval relevance score.
     score: float
+    # 中文：`context_chunk` 可为更完整 Parent；`chunk` 始终保持精确可引用 Child。
+    # English: `context_chunk` may be a parent; `chunk` always remains the precise citable child.
+    context_chunk: Chunk | None = None
 
 
 @dataclass(frozen=True, slots=True)
