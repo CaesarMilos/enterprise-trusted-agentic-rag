@@ -25,8 +25,38 @@ _LATIN_TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 # 中文：高频疑问和连接词不应抬高来源路由或证据覆盖率。
 # English: Frequent question and connective terms should not inflate routing or coverage.
 _STOP_TERMS = frozenset(
-    {"什么", "哪些", "如何", "怎么", "是否", "根据", "以及", "其中", "一个", "这个"}
+    {
+        "什么",
+        "哪些",
+        "如何",
+        "怎么",
+        "是否",
+        "根据",
+        "依据",
+        "回答",
+        "引用",
+        "请问",
+        "以及",
+        "其中",
+        "一个",
+        "这个",
+    }
 )
+
+
+def query_term_weights(query: str) -> dict[str, float]:
+    """中文：为结构锚点和普通内容词生成确定性 BM25 查询权重。
+
+    English: Build deterministic BM25 query weights for structural anchors and content terms.
+    """
+
+    weights: dict[str, float] = {}
+    for term in lexical_tokens(query):
+        # 中文：精确条款、章节和步骤锚点必须显著高于普通中文二元词。
+        # English: Exact clause/chapter/step anchors must dominate ordinary CJK bigrams.
+        weight = 8.0 if term.startswith(("clause:", "chapter:", "step:")) else 1.0
+        weights[term] = max(weights.get(term, 0.0), weight)
+    return weights
 
 
 def lexical_tokens(text: str) -> tuple[str, ...]:
@@ -67,7 +97,9 @@ class BM25IndexBuilder:
         # 其精确定义与约束见下方英文说明。
         # English: Per-document term counts preserve enough information for exact BM25
         #   scoring.
-        term_frequencies = [dict(Counter(lexical_tokens(entry.text))) for entry in plan.entries]
+        term_frequencies = [
+            dict(Counter(lexical_tokens(entry.keyword_text))) for entry in plan.entries
+        ]
         # 中文：变量 `document_lengths` 用于保存“文档`lengths`”相关数据；
         # 其精确定义与约束见下方英文说明。
         # English: Document lengths use the same tokenizer as term frequencies.
@@ -204,7 +236,10 @@ class PersistentBM25Index:
         # 其精确定义与约束见下方英文说明。
         # English: Unique terms prevent repeated query words from arbitrarily scaling
         #   scores.
-        query_terms = frozenset(lexical_tokens(query))
+        query_terms = query_term_weights(query)
+        query_anchors = {
+            term for term in query_terms if term.startswith(("clause:", "chapter:", "step:"))
+        }
         # 中文：变量 `document_count` 用于保存“文档`count`”相关数据；
         # 其精确定义与约束见下方英文说明。
         # English: Corpus size is used by Robertson-Sparck Jones inverse document frequency.
@@ -219,7 +254,7 @@ class PersistentBM25Index:
             # 其精确定义与约束见下方英文说明。
             # English: Row score sums each query term's BM25 contribution.
             score = 0.0
-            for term in query_terms:
+            for term, query_weight in query_terms.items():
                 term_frequency = self._term_frequencies[row_id].get(term, 0)
                 if term_frequency == 0:
                     continue
@@ -236,9 +271,16 @@ class PersistentBM25Index:
                     else 0.0
                 )
                 denominator = term_frequency + self._k1 * (1 - self._b + self._b * length_ratio)
-                score += inverse_document_frequency * (
+                score += query_weight * inverse_document_frequency * (
                     term_frequency * (self._k1 + 1) / denominator
                 )
+            # 中文：关键变量 `exact_anchor_hits` 为条号等结构匹配提供确定性直达增益。
+            # English: Key variable `exact_anchor_hits` gives deterministic direct-hit priority
+            # to structural identifiers.
+            exact_anchor_hits = query_anchors & set(
+                extract_exact_anchors(entry.section_number or entry.keyword_text)
+            )
+            score += 100.0 * len(exact_anchor_hits)
             if score > 0:
                 scored.append((entry.chunk_id, score))
         # 中文：本步骤涉及文本块、标识符，具体约束见下方英文说明。

@@ -8,7 +8,11 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 
+from enterprise_rag.agent.proposition_extractor import required_temporal_roles, semantic_signals
 from enterprise_rag.domain.models import Chunk
+from enterprise_rag.domain.questions import InformationNeed, QuestionPlan
+from enterprise_rag.indexing.bm25_index import lexical_tokens
+from enterprise_rag.retrieval.identifier_normalizer import extract_exact_anchors
 from enterprise_rag.retrieval.models import RetrievalCandidate, TopKDecision
 
 
@@ -61,6 +65,7 @@ class DynamicTopK:
         self,
         candidates: tuple[RetrievalCandidate, ...],
         chunks: Mapping[str, Chunk],
+        plan: QuestionPlan | None = None,
     ) -> tuple[tuple[RetrievalCandidate, ...], TopKDecision]:
         """中文：该函数或方法负责“选择”相关处理。
 
@@ -74,8 +79,23 @@ class DynamicTopK:
         if not available:
             return (), TopKDecision(0, "No authorized candidates were available.")
         # 中文：变量 `target` 用于保存“`target`”相关数据；其精确定义与约束见下方英文说明。
-        # English: Initial target is bounded by the candidate count and configured default.
-        target = min(self._default_k, len(available), self._max_k)
+        # English: Target expands for independent required needs and an explicit answer
+        # cardinality, but never directly for raw anchor count.
+        required_needs = (
+            tuple(need for need in plan.needs if need.necessity.value == "required")
+            if plan is not None
+            else ()
+        )
+        requested_count = (
+            plan.response_contract.requested_item_count
+            if plan is not None and plan.response_contract.requested_item_count is not None
+            else 0
+        )
+        target = min(
+            max(self._default_k, len(required_needs), requested_count),
+            len(available),
+            self._max_k,
+        )
         # 中文：变量 `gap_reason` 用于保存“`gap`原因”相关数据；
         # 其精确定义与约束见下方英文说明。
         # English: Score gaps after the minimum can shrink or expand the default selection.
@@ -96,7 +116,27 @@ class DynamicTopK:
                 target = index + 1
                 gap_reason = "Stopped at a meaningful relevance-score gap."
                 break
-        target = max(min(target, upper_scan), min(self._min_k, upper_scan))
+        # 中文：分数断层可以压缩普通查询，但不得压缩到明示 Need/项数基数以下。
+        # English: Score gaps may shrink ordinary queries but never below explicit need/cardinality
+        # requirements.
+        semantic_floor = min(
+            max(self._min_k, len(required_needs), requested_count),
+            upper_scan,
+        )
+        target = max(min(target, upper_scan), semantic_floor)
+        # 中文：每个 required Need 先获得一个最佳候选配额，剩余名额再按全局排名填充。
+        # English: Reserve the best candidate per required need, then fill remaining slots by
+        # global rank.
+        reserved_ids, candidate_need_ids = _reserve_need_candidates(
+            required_needs,
+            available,
+            chunks,
+            plan,
+        )
+        by_id = {candidate.chunk_id: candidate for candidate in available}
+        selection_order = tuple(by_id[item] for item in reserved_ids) + tuple(
+            candidate for candidate in available if candidate.chunk_id not in reserved_ids
+        )
         # 中文：变量 `selected` 用于保存“选中的”相关数据；其精确定义与约束见下方英文说明。
         # English: Selected items enforce document diversity and context budget in rank
         #   order.
@@ -118,7 +158,8 @@ class DynamicTopK:
         # 中文：变量 `dropped` 用于保存“`dropped`”相关数据；其精确定义与约束见下方英文说明。
         # English: Dropped identifiers explain deduplication and budget decisions.
         dropped: list[str] = []
-        for candidate in available[: self._max_k]:
+        selected_need_ids: set[str] = set()
+        for candidate in selection_order[: self._max_k]:
             chunk = chunks[candidate.chunk_id]
             family_id = chunk.parent_chunk_id or chunk.id
             if family_id in selected_families:
@@ -140,6 +181,7 @@ class DynamicTopK:
                 dropped.append(candidate.chunk_id)
                 continue
             selected.append(candidate)
+            selected_need_ids.update(candidate_need_ids.get(candidate.chunk_id, ()))
             selected_families.add(family_id)
             document_counts[chunk.document_id] = document_counts.get(chunk.document_id, 0) + 1
             used_tokens += chunk.token_count
@@ -158,5 +200,77 @@ class DynamicTopK:
                 selected_k=len(selected),
                 reason=reason,
                 dropped_chunk_ids=tuple(dropped),
+                covered_need_ids=tuple(
+                    need.id for need in required_needs if need.id in selected_need_ids
+                ),
+                uncovered_need_ids=tuple(
+                    need.id for need in required_needs if need.id not in selected_need_ids
+                ),
             ),
         )
+
+
+def _reserve_need_candidates(
+    needs: tuple[InformationNeed, ...],
+    candidates: tuple[RetrievalCandidate, ...],
+    chunks: Mapping[str, Chunk],
+    plan: QuestionPlan | None,
+) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
+    """中文：为每个独立 Need 保留一个最佳候选，同一 Chunk 可同时覆盖多个 Need。
+
+    English: Reserve one best candidate per independent need while allowing one chunk to cover
+    multiple needs.
+    """
+
+    if not needs:
+        return (), {}
+    anchors = {anchor.id: anchor.normalized_value for anchor in plan.anchors} if plan else {}
+    candidate_need_ids: dict[str, tuple[str, ...]] = {}
+    reserved: list[str] = []
+    for need in needs:
+        query_terms = _selection_terms(need.retrieval_query)
+        # 中文：每个 Need 的关键时间角色构成候选资格，而不仅是排序加分。
+        # English: Critical temporal roles qualify a candidate instead of merely boosting it.
+        required_time_roles = required_temporal_roles(need.retrieval_query)
+        required_anchors = {
+            anchors[anchor_id] for anchor_id in need.anchor_ids if anchor_id in anchors
+        }
+        best: tuple[float, str] | None = None
+        for rank, candidate in enumerate(candidates):
+            chunk = chunks.get(candidate.chunk_id)
+            if chunk is None:
+                continue
+            chunk_terms = _selection_terms(chunk.search_text)
+            lexical = len(query_terms & chunk_terms) / len(query_terms) if query_terms else 0.0
+            chunk_anchors = set(extract_exact_anchors(chunk.search_text))
+            if required_anchors and not required_anchors <= chunk_anchors:
+                continue
+            if (
+                required_time_roles
+                and not required_time_roles <= semantic_signals(chunk.search_text).temporal_roles
+            ):
+                continue
+            if lexical <= 0.0 and not required_anchors:
+                continue
+            # 中文：词汇覆盖优先，原始排名用作稳定平局因子。
+            # English: Lexical coverage leads; original rank is a deterministic tie-breaker.
+            score = lexical + 1.0 / (1000.0 + rank)
+            if best is None or score > best[0]:
+                best = (score, candidate.chunk_id)
+        if best is None:
+            continue
+        chunk_id = best[1]
+        if chunk_id not in reserved:
+            reserved.append(chunk_id)
+        current = candidate_need_ids.get(chunk_id, ())
+        candidate_need_ids[chunk_id] = (*current, need.id)
+    return tuple(reserved), candidate_need_ids
+
+
+def _selection_terms(text: str) -> frozenset[str]:
+    """中文：生成 Need 配额匹配用的稳定词项集。
+
+    English: Build stable terms for need-quota matching.
+    """
+
+    return frozenset(term for term in lexical_tokens(text) if len(term) > 1 or ":" in term)

@@ -1,63 +1,74 @@
-# V4 实现与验证状态
+# V5 实现与验证状态 / Implementation status
 
-本文件只记录当前源码中可以核对的事实，不把缺少外部运行时的项目写成已完成。
+版本：`0.5.0`。本页是事实清单，不是路线图；“已实现”表示代码进入主链路，“已验证”表示存在当前环境实际执行的自动化或 E2E 证据。
 
-## 已实现：生产可信化
+## 已实现并由自动化覆盖
 
-- `lifecycle_generation` 删除 fencing、删除请求/完成时间和不可逆删除状态。
-- 任务 generation 快照、取消请求/原因、租约、attempt token、心跳和失效 Worker 写入阻断。
-- 文档、任务、索引显式状态机；Worker 异常不会覆盖删除状态。
-- 统一候选索引构建、Manifest 校验、重新加载验证、租户级 CAS 激活、失败状态收口和旧活动版本保留。
-- Agent 单调时钟硬截止；检索、改写、回答和引用校验前后检查，模型子调用接收剩余预算。
-- `demo`、`jwt`、`trusted_proxy` 互斥认证；生产 Demo 禁用和密钥缺失 fail-closed。
-- JWT HS256 的签名、时效、issuer、audience、用户和租户声明验证。
-- JWT 模式忽略客户端伪造身份头；可信代理模式要求共享密钥；Nginx 清洗身份头。
-- 开发/生产 Compose 分离、API 内网暴露、非 root 容器、只读根文件系统和依赖锁。
-- SQLite 启动时幂等补充 V4 生命周期、任务取消、版本策略和索引状态列。
+- Alembic V4 baseline 与 V5 expand migration；可识别合法旧 V4 schema，拒绝未知未版本化 schema。
+- SQLite 数据库父目录与 uploads/indexes/traces 运行目录自动创建。
+- Lease 结果分流：cancel、ownership lost、expired、generation stale。
+- Worker CAS 终态、心跳取消、旧租约写保护和删除 generation fence。
+- Embedding 整篇预取、lexical 整篇降级、文档级缓存释放。
+- 共享有界 Provider 执行器、剩余 Deadline 传递和超时返回上限。
+- 原子文档版本分配与 retry/reprocess 幂等键。
+- 四种 canonical Profile、NormalizedDocument、三层 Locator、通用结构适配器。
+- QuestionPlan、格式指令剥离、精确锚点、required Need、改写漂移门禁。
+- Need-aware Dynamic Top-K、文档/Parent 去重、同硬边界局部窗口。
+- 法规条款硬边界、正文优先双通道索引文本、精确重复向量发布门禁。
+- Need 级证据评分与时间角色资格过滤；“应当/不得”不再触发全局冲突。
+- 命题关系确定性判定：同主体/动作/对象/条件/时间/authority 且模态互斥才判冲突。
+- 确定性命题抽取及 Claim 的实体、时间、模态、数字、锚点一致性验证。
+- 完整/部分/拒答分流；部分回答只生成已完整支持的 required Need，并披露未解决项。
+- `VerifiedAnswer`、`AnswerItem`、`AnswerClaim`、`MissingInformation` 通过 additive API 字段进入主链路。
+- Claim 无法绑定 Need/Evidence/Citation 时整体拒答，不退化为无审计自然语言。
+- Worker 在 fencing 事务中写入独立 `QualityReport`、质量指标、警告与降级码。
+- 请求固定 index/source/document-version 快照；普通切换可完成，删除/撤权立即覆盖。
+- 异步删除 `202`、持久 deletion job、状态查询、索引重建、文件清理和终态提交。
+- Citation 返回前重新检查 Source、Document、DocumentVersion 与固定 scope。
+- Router、Dense、BM25、RRF、Rerank、selected Child 和 Parent 映射 Trace。
+- `snapshot_id` 与 `index_version_id` 作为 Trace 正式字段持久化并返回。
+- 评测使用正确层级排名，并计算 false refusal/unsafe answer rate。
+- V5 Manifest 保存 tokenizer、normalizer、chunk strategy、内容 hash 与映射指纹。
+- 统一开发启动脚本、Windows CMD 入口、UI Job/Document/Trace 状态和重建确认。
 
-## 已实现：自适应中文 RAG
+## 已接入骨架但仍待完成的治理闭环
 
-- PDF/Markdown/TXT 统一 Loader、PDF 逐页质量检测与可插拔 Tesseract OCR。
-- 六种内容画像和低置信度通用回退。
-- 标题、章/节/条/款/项、步骤、警告、参数、API、代码、表格和自然段结构识别。
-- 保护 URL、小数、版本号、括号和引号的中文句子安全切分。
-- 五特征自适应边界公式、动态长度阈值、批量 Embedding、缓冲区质心连续性和完整边界 Trace。
-- 硬边界优先；LLM 仅复核模糊分数带，且有单文档预算与确定性失败回退。
-- 过长单元安全切分、同父结构短块合并、只写入检索文本的完整句重叠。
-- 稳定 Child/Parent ID、双向关系、Child-only 建索引、Parent 预算扩展和 Child 精确引用。
-- 中文字符/二元词组/英文词/条款锚点 BM25、向量召回、RRF、重排和故障降级。
-- 动态 Top-K 的分数断层、Parent 去重、单文档占比与上下文 Token 预算。
-- Query Rewrite 次数/模型/Token/时间预算，以及引用存在性、ACL、版本和基础支持校验。
-- 空/超长/重复/碎片/页码/父子关系质量门和固定评测报告比较工具。
+| 能力 | 已有部分 | 正式版尚需完成 |
+|---|---|---|
+| SourceContract | 领域契约、Profile 映射、ORM 字段 | 管理 API、版本冻结展示、完整迁移 UI |
+| QualityReport | 领域模型、独立表、Worker 幂等写入和 Repository 查询 | 管理 API 展示、UI 独立报告详情和人工复核动作 |
+| VerifiedAnswer | 逐句 Claim 绑定、完整校验、Partial 状态和 API v1 additive 投影 | 冲突披露 UI、版本化 API 文档及复杂表格 Claim 拆分 |
+| Proposition | 领域模型、确定性抽取器、语义槽位校验与关系 Judge | LLM 模糊复核、authority/version 优先级策略 |
+| OperationalEvent | ORM 表 | 所有状态转换统一写审计事件与防篡改导出 |
+| Trace 治理 | 脱敏、候选上限配置、数据库摘要 | 自动 retention 清理与角色分级诊断视图 |
 
-## 当前自动验证结果
+## 本次工作区验证
 
-在当前工作区运行：
+当前环境执行：
 
 ```text
-ruff check src tests scripts       PASS
-mypy src                           PASS（135 个源码文件）
-pytest -q                          PASS（62 passed, 2 skipped）
-uv pip check                       PASS（65 个已安装包兼容）
-uv lock --check                    PASS
-中英双语文档字符串审计             PASS（0 缺失、0 非双语）
+Ruff: passed
+MyPy strict: passed
+Pytest: 110 passed, 2 skipped
 ```
 
-自动测试覆盖配置、稳定 ID、内容画像、结构/语义边界、LLM 预算回退、Parent-Child、中文检索、Agent 预算、JWT/可信代理、租户范围、SQLite 持久化、删除 generation 竞态、索引状态和 HTTP 上传边界。
+跳过项：
 
-## 当前环境未执行
+- FAISS 真实 E2E：环境未安装/加载真实 FAISS runtime。
+- OCR 真实 E2E：环境未安装 PyMuPDF `fitz`；也不能据此声称 Tesseract 已验收。
 
-- 真实 FAISS + FastAPI + Worker 端到端测试：缺少 `faiss`，测试明确跳过。
-- 真实中文 OCR 集成测试：缺少 `PyMuPDF/fitz`，测试明确跳过。
-- Docker 构建与 Compose 冒烟：当前执行环境没有 Docker 命令。
-- 真实 Ollama/Qwen、目标 Embedding 和 Cross-Encoder 回归：需要目标模型服务与模型缓存。
-- 固定企业中文黄金集的候选/基线指标：需要项目方提供或完成授权语料标注。
+已存在一个 FastAPI/Starlette `TestClient` 弃用警告，不影响业务测试，但应在依赖升级批次处理。
 
-这些项目是生产发布的阻断项，而不是代码单元门禁失败。应在具备对应运行时和真实评测数据的目标环境执行 `docs/DEPLOYMENT.md` 与 `docs/EVALUATION.md` 中的验收步骤。
+## 正式 v0.5.0 发布阻断项
 
-## 残余生产风险
+1. 用真实民法典、技术说明书、设备说明书和 SOP 运行同版黄金集。
+2. 验证第八条、六项聚合、第十六条例外和无答案拒答，不只运行合成单元测试。
+3. 完成复杂表格回答的 Claim 拆分、冲突披露 UI 和 LLM 模糊命题复核。
+4. 完成 SourceContract 管理闭环及 QualityReport 管理 API/UI。
+5. 在 Windows、Ollama、FAISS、OCR、Docker 环境分别留下可复现实测报告。
+6. 量化 P50/P95/P99、最大文件/页数/Chunk、并发、资源与模型成本。
+7. 执行数据库备份恢复、索引重建、迁移失败回滚与删除证明演练。
 
-- 当前持久化基线是单机 SQLite 和本地不可变索引；多主机部署需要支持分布式锁/CAS 的数据库和共享对象存储适配器。
-- Docker 基础镜像已固定补丁版本，但生产供应链仍应使用组织批准的镜像 digest 和 Debian 包快照。
-- HS256 适合受控单体部署；跨服务身份平台建议增加 OIDC/JWKS 非对称签名适配器和密钥轮换。
-- 规则与默认权重已经可配置和版本化，但最终阈值必须由固定中文黄金集调优，不能以默认值代替业务验收。
+English summary: V0.5.0 implements the principal correctness, retrieval, partial-answer, claim-binding,
+and quality-report paths. Skipped real runtimes and remaining governance integrations prevent a
+final production-complete claim.

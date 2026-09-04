@@ -6,7 +6,7 @@ English: Safely expand parent context after precise child hits under an evidence
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from enterprise_rag.domain.models import Chunk
 from enterprise_rag.retrieval.models import RetrievalCandidate
@@ -61,7 +61,22 @@ class ParentExpander:
                 and child.parent_chunk_id is not None
             )
         )
-        loaded_parents = {chunk.id: chunk for chunk in loader(tenant_id, parent_ids)}
+        # 中文：同批读取 Parent 和相邻 Child，避免大 Parent 回退时只剩一个孤立块。
+        # English: Load parents and adjacent children together so oversized parents can fall
+        # back to a safe local window instead of one isolated child.
+        neighbor_ids = tuple(
+            dict.fromkeys(
+                neighbor_id
+                for candidate in candidates
+                if (child := children.get(candidate.chunk_id)) is not None
+                for neighbor_id in (child.previous_chunk_id, child.next_chunk_id)
+                if neighbor_id is not None
+            )
+        )
+        loaded = {chunk.id: chunk for chunk in loader(tenant_id, (*parent_ids, *neighbor_ids))}
+        loaded_parents = {
+            chunk_id: chunk for chunk_id, chunk in loaded.items() if chunk.chunk_level == "parent"
+        }
         contexts: dict[str, Chunk] = {}
         chosen_parent_ids: list[str] = []
         charged_context_ids: set[str] = set()
@@ -79,6 +94,11 @@ class ParentExpander:
                     )
                     if projected <= self._context_token_budget:
                         selected = parent
+            if selected is child:
+                # 中文：局部窗口只合并同版本、同结构 Parent 和同硬边界的相邻块。
+                # English: Local windows include only same-version, same-parent, same-hard-boundary
+                # siblings.
+                selected = self._local_window(child, loaded)
             charge = 0 if selected.id in charged_context_ids else selected.token_count
             if used_tokens + charge > self._context_token_budget:
                 selected = child
@@ -110,3 +130,64 @@ class ParentExpander:
             and parent.document_id == child.document_id
             and parent.document_version_id == child.document_version_id
         )
+
+    def _local_window(self, child: Chunk, loaded: Mapping[str, Chunk]) -> Chunk:
+        """中文：构建“前一同级 + 命中 + 后一同级”的临时上下文块。
+
+        English: Build an ephemeral previous-hit-next sibling context window.
+        """
+
+        siblings = [
+            candidate
+            for identifier in (child.previous_chunk_id, child.id, child.next_chunk_id)
+            if (candidate := (child if identifier == child.id else loaded.get(identifier or "")))
+            is not None
+            and self._valid_sibling(child, candidate)
+        ]
+        if len(siblings) <= 1:
+            return child
+        total_tokens = sum(item.token_count for item in siblings)
+        if total_tokens > self._max_parent_tokens:
+            return child
+        return replace(
+            child,
+            id=f"local-window:{child.id}",
+            text="\n\n".join(item.text for item in siblings),
+            retrieval_text="\n\n".join(item.search_text for item in siblings),
+            token_count=total_tokens,
+            page_start=min(
+                (item.page_start for item in siblings if item.page_start is not None),
+                default=child.page_start,
+            ),
+            page_end=max(
+                (item.page_end for item in siblings if item.page_end is not None),
+                default=child.page_end,
+            ),
+            chunk_level="local_window",
+            metadata={
+                **child.metadata,
+                "local_window_chunk_ids": tuple(item.id for item in siblings),
+            },
+        )
+
+    @staticmethod
+    def _valid_sibling(child: Chunk, sibling: Chunk) -> bool:
+        """中文：防止局部窗口跨租户、Source、文档、版本、Parent 或条款硬边界。
+
+        English: Prevent local windows crossing tenant, source, document, version, parent, or
+        hard structural boundaries.
+        """
+
+        same_identity = (
+            sibling.chunk_level == "leaf"
+            and sibling.tenant_id == child.tenant_id
+            and sibling.source_id == child.source_id
+            and sibling.document_id == child.document_id
+            and sibling.document_version_id == child.document_version_id
+            and sibling.parent_chunk_id == child.parent_chunk_id
+        )
+        if not same_identity:
+            return False
+        if child.hard_boundary_key is not None:
+            return sibling.hard_boundary_key == child.hard_boundary_key
+        return sibling.hard_boundary_key is None

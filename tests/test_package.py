@@ -9,7 +9,7 @@ from enterprise_rag import __version__
 def test_package_version() -> None:
     """中文：该测试用于验证“软件包版本”相关行为。
 
-    English: Ensure the installed package exposes the expected V4 stable version.
+    English: Ensure the installed package exposes the expected V5 release version.
     """
 
-    assert __version__ == "0.4.0"
+    assert __version__ == "0.5.0"

@@ -5,15 +5,14 @@ English: Create SQLAlchemy engines, sessions, schema, and explicit transaction b
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
-from enterprise_rag.infrastructure.persistence.orm_models import Base
+from enterprise_rag.infrastructure.persistence.migrations import upgrade_database
 
 
 def create_database_engine(database_url: str, echo: bool = False) -> Engine:
@@ -72,109 +71,12 @@ def create_session_factory(engine: Engine) -> sessionmaker[Session]:
 
 
 def initialize_database(engine: Engine) -> None:
-    """中文：该函数或方法负责“初始化数据库”相关处理。
+    """中文：通过正式 Alembic revision 初始化空库或接管已验证 V4 库。
 
-    English: Create every declared metadata table for local and test deployments.
+    English: Initialize an empty database or adopt a verified V4 database through Alembic.
     """
 
-    Base.metadata.create_all(engine)
-    _migrate_source_content_profile_columns(engine)
-    _migrate_document_version_snapshot_column(engine)
-    _migrate_v4_lifecycle_columns(engine)
-
-
-def _migrate_source_content_profile_columns(engine: Engine) -> None:
-    """中文：为 V4 之前的数据库补充内容画像列并保留全部已有资料源。
-
-    English: Add source-profile columns to pre-V4 databases without deleting existing data.
-    """
-
-    # 中文：变量 `existing_columns` 保存当前 sources 表的真实列名，迁移因此可重复执行。
-    # English: Existing column names make this lightweight migration idempotent.
-    existing_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
-    with engine.begin() as connection:
-        if "content_profile" not in existing_columns:
-            connection.execute(
-                text(
-                    "ALTER TABLE sources ADD COLUMN content_profile "
-                    "VARCHAR(32) NOT NULL DEFAULT 'general_prose'"
-                )
-            )
-        if "chunk_strategy_override" not in existing_columns:
-            connection.execute(
-                text("ALTER TABLE sources ADD COLUMN chunk_strategy_override VARCHAR(128)")
-            )
-
-
-def _migrate_document_version_snapshot_column(engine: Engine) -> None:
-    """中文：为 V4 之前的数据库补充接入策略快照 JSON 列。
-
-    English: Add the ingestion-strategy snapshot JSON column to pre-V4 databases.
-    """
-
-    existing_columns = {
-        column["name"] for column in inspect(engine).get_columns("document_versions")
-    }
-    if "ingestion_snapshot" in existing_columns:
-        return
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "ALTER TABLE document_versions ADD COLUMN ingestion_snapshot JSON "
-                "NOT NULL DEFAULT '{}'"
-            )
-        )
-
-
-def _migrate_v4_lifecycle_columns(engine: Engine) -> None:
-    """中文：幂等补充 V4 文档 fencing、任务取消与索引终态字段。
-
-    English: Idempotently add V4 document fencing, job cancellation, and index terminal fields.
-
-    中文：本发行版以 SQLite 为持久化基线；其他数据库适配器必须提供版本化迁移。
-    English: SQLite is this distribution's baseline; other database adapters need migrations.
-    """
-
-    # 中文：每张表独立检查列集合，重复启动不会再次执行 ALTER TABLE。
-    # English: Each table is inspected independently so repeated startup never repeats ALTERs.
-    table_columns = {
-        table: {column["name"] for column in inspect(engine).get_columns(table)}
-        for table in ("documents", "ingestion_jobs", "index_versions")
-    }
-    statements = {
-        "documents": {
-            "lifecycle_generation": (
-                "ALTER TABLE documents ADD COLUMN lifecycle_generation INTEGER "
-                "NOT NULL DEFAULT 0"
-            ),
-            "delete_requested_at": (
-                "ALTER TABLE documents ADD COLUMN delete_requested_at DATETIME"
-            ),
-            "deleted_at": "ALTER TABLE documents ADD COLUMN deleted_at DATETIME",
-        },
-        "ingestion_jobs": {
-            "document_generation_snapshot": (
-                "ALTER TABLE ingestion_jobs ADD COLUMN document_generation_snapshot INTEGER "
-                "NOT NULL DEFAULT 0"
-            ),
-            "cancel_requested_at": (
-                "ALTER TABLE ingestion_jobs ADD COLUMN cancel_requested_at DATETIME"
-            ),
-            "cancel_reason": (
-                "ALTER TABLE ingestion_jobs ADD COLUMN cancel_reason VARCHAR(128)"
-            ),
-        },
-        "index_versions": {
-            "error_code": "ALTER TABLE index_versions ADD COLUMN error_code VARCHAR(128)",
-            "error_message": "ALTER TABLE index_versions ADD COLUMN error_message TEXT",
-            "completed_at": "ALTER TABLE index_versions ADD COLUMN completed_at DATETIME",
-        },
-    }
-    with engine.begin() as connection:
-        for table, columns in statements.items():
-            for column, statement in columns.items():
-                if column not in table_columns[table]:
-                    connection.execute(text(statement))
+    upgrade_database(engine, adopt_v4=True)
 
 
 @contextmanager

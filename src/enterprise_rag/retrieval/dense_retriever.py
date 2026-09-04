@@ -5,6 +5,7 @@ English: Retrieve permission-filtered dense candidates from one pinned index ver
 
 from __future__ import annotations
 
+from enterprise_rag.core.deadline import DeadlineBudget
 from enterprise_rag.domain.protocols.indexes import DenseIndex
 from enterprise_rag.indexing.embedding_service import EmbeddingService
 from enterprise_rag.retrieval.models import RetrievalCandidate, RetrievalQuery
@@ -34,7 +35,11 @@ class DenseRetriever:
         # English: Candidate limit controls pre-fusion work.
         self._candidate_k = candidate_k
 
-    def retrieve(self, query: RetrievalQuery) -> tuple[RetrievalCandidate, ...]:
+    def retrieve(
+        self,
+        query: RetrievalQuery,
+        deadline: DeadlineBudget | None = None,
+    ) -> tuple[RetrievalCandidate, ...]:
         """中文：该函数或方法负责“执行一次检索”相关处理。
 
         English: Return dense candidates with one-based ranks.
@@ -44,7 +49,13 @@ class DenseRetriever:
         # 其精确定义与约束见下方英文说明。
         # English: Query vector uses the configured provider fingerprint matching the
         #   index manifest.
-        query_vector = self._embeddings.embed_query(query.normalized_text)
+        timeout_seconds = (
+            deadline.timeout_for_call("dense_embedding") if deadline is not None else None
+        )
+        query_vector = self._embeddings.embed_query(
+            query.normalized_text,
+            timeout_seconds=timeout_seconds,
+        )
         # 中文：变量 `results` 用于保存“结果”相关数据；其精确定义与约束见下方英文说明。
         # English: Index applies the query's exact ACL scope before returning stable chunk
         #   IDs.

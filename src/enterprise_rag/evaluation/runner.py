@@ -43,6 +43,12 @@ class EvaluationPrediction:
     # 其精确定义与约束见下方英文说明。
     # English: Ranked retrieved chunk IDs before final evidence selection.
     retrieved_chunk_ids: tuple[str, ...]
+    # 中文：各排名必须来自对应 Trace 阶段，不得用最终引用代替。
+    # English: Each ranking comes from its matching trace stage, never final citations.
+    dense_chunk_ids: tuple[str, ...] = ()
+    bm25_chunk_ids: tuple[str, ...] = ()
+    fused_chunk_ids: tuple[str, ...] = ()
+    reranked_chunk_ids: tuple[str, ...] = ()
 
 
 class EvaluationRunner:
@@ -125,6 +131,26 @@ class EvaluationRunner:
                     prediction.retrieved_chunk_ids,
                     5,
                 ),
+                "dense_recall_at_5": recall_at_k(
+                    example.relevant_chunk_ids,
+                    prediction.dense_chunk_ids,
+                    5,
+                ),
+                "bm25_recall_at_5": recall_at_k(
+                    example.relevant_chunk_ids,
+                    prediction.bm25_chunk_ids,
+                    5,
+                ),
+                "rrf_recall_at_5": recall_at_k(
+                    example.relevant_chunk_ids,
+                    prediction.fused_chunk_ids,
+                    5,
+                ),
+                "rerank_recall_at_5": recall_at_k(
+                    example.relevant_chunk_ids,
+                    prediction.reranked_chunk_ids,
+                    5,
+                ),
                 "refused": is_refusal,
             }
             if isinstance(prediction.result, AnswerResult):
@@ -177,15 +203,24 @@ class EvaluationRunner:
             ]
             if values:
                 aggregates[name] = mean(values)
+        counts = refusal_counts(
+            tuple(expected_refusals),
+            tuple(predicted_refusals),
+        )
+        answerable_count = sum(not value for value in expected_refusals)
+        unanswerable_count = sum(expected_refusals)
+        aggregates["false_refusal_rate"] = (
+            counts["false_refusal"] / answerable_count if answerable_count else 0.0
+        )
+        aggregates["unsafe_answer_rate"] = (
+            counts["missed_refusal"] / unanswerable_count if unanswerable_count else 0.0
+        )
         report: dict[str, object] = {
             "dataset": {"name": dataset.name, "version": dataset.version},
             "random_seed": self._random_seed,
             "fingerprints": self._fingerprints,
             "metrics": aggregates,
-            "refusal_counts": refusal_counts(
-                tuple(expected_refusals),
-                tuple(predicted_refusals),
-            ),
+            "refusal_counts": counts,
             "examples": rows,
         }
         output_dir.mkdir(parents=True, exist_ok=True)

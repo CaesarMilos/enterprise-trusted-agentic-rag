@@ -1,6 +1,6 @@
-"""中文：比较固定评测集的基线与候选报告，并执行 V4 质量回归门禁。
+"""中文：比较固定评测集的基线与候选报告，并执行 V5 质量回归门禁。
 
-English: Compare baseline and candidate reports and enforce V4 quality-regression gates.
+English: Compare baseline and candidate reports and enforce V5 quality-regression gates.
 """
 
 from __future__ import annotations

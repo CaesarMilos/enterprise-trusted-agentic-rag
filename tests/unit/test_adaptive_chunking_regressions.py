@@ -316,9 +316,7 @@ def test_civil_code_pdf_reflow_keeps_clause_and_subitems_together() -> None:
         (RawBlock(raw_text, "page", 24),),
     )
     units = StructureParser().parse(TextCleaner().clean(loaded))
-    strategy = build_default_strategy_registry(40, 80, 140).resolve(
-        ContentProfile.GENERAL_PROSE
-    )
+    strategy = build_default_strategy_registry(40, 80, 140).resolve(ContentProfile.GENERAL_PROSE)
     chunks = strategy.chunk(units, _context())
 
     clause = next(chunk for chunk in chunks if chunk.section_number == "第一百四十三条")
@@ -346,9 +344,11 @@ def test_markdown_heading_is_indexed_and_remains_a_hard_boundary() -> None:
         ),
     )
     units = StructureParser().parse(TextCleaner().clean(loaded))
-    chunks = build_default_strategy_registry(3, 20, 80).resolve(
-        ContentProfile.GENERAL_PROSE
-    ).chunk(units, _context())
+    chunks = (
+        build_default_strategy_registry(3, 20, 80)
+        .resolve(ContentProfile.GENERAL_PROSE)
+        .chunk(units, _context())
+    )
     leaves = tuple(chunk for chunk in chunks if chunk.chunk_level == "leaf")
 
     assert len(leaves) == 2
@@ -369,9 +369,13 @@ def test_manual_steps_generate_parent_child_context() -> None:
         _unit("步骤2 连接接地线。", "step", heading),
         _unit("步骤3 检查指示灯。", "step", heading),
     )
-    chunks = build_default_strategy_registry(3, 20, 100).resolve(ContentProfile.MANUAL).chunk(
-        units,
-        _context(),
+    chunks = (
+        build_default_strategy_registry(3, 20, 100)
+        .resolve(ContentProfile.MANUAL)
+        .chunk(
+            units,
+            _context(),
+        )
     )
     parents = tuple(chunk for chunk in chunks if chunk.chunk_level == "parent")
     leaves = tuple(chunk for chunk in chunks if chunk.chunk_level == "leaf")
@@ -387,9 +391,7 @@ def test_single_document_top_k_does_not_apply_diversity_half_cap() -> None:
     """
 
     chunks = {f"c{index}": _chunk(f"c{index}", "document-a") for index in range(4)}
-    candidates = tuple(
-        RetrievalCandidate(f"c{index}", 1.0 - index * 0.05) for index in range(4)
-    )
+    candidates = tuple(RetrievalCandidate(f"c{index}", 1.0 - index * 0.05) for index in range(4))
     selected, decision = DynamicTopK(3, 4, 4, 1000).select(candidates, chunks)
 
     assert len(selected) == 4

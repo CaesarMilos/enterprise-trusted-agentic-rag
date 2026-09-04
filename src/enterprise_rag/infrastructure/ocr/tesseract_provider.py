@@ -77,9 +77,7 @@ class TesseractOCRProvider:
                 )
         finally:
             document.close()
-        mean_confidence = (
-            sum(confidences) / len(confidences) / 100.0 if confidences else 0.0
-        )
+        mean_confidence = sum(confidences) / len(confidences) / 100.0 if confidences else 0.0
         version = f"tesseract-{pytesseract.get_tesseract_version()}:{self._language}:dpi{self._dpi}"
         return OCRResult(tuple(blocks), mean_confidence, version)
 

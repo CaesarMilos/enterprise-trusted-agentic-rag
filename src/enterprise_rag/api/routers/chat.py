@@ -11,7 +11,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 
 from enterprise_rag.api.dependencies import AppContainer, get_container, get_user_context
-from enterprise_rag.api.schemas import ChatRequest, ChatResponse, CitationSchema
+from enterprise_rag.api.schemas import (
+    AnswerClaimSchema,
+    AnswerItemSchema,
+    ChatRequest,
+    ChatResponse,
+    CitationSchema,
+    MissingInformationSchema,
+)
 from enterprise_rag.domain.models import UserContext
 from enterprise_rag.domain.requests import ChatCommand
 from enterprise_rag.domain.results import AnswerResult
@@ -43,11 +50,55 @@ def chat(
         )
     )
     if isinstance(result, AnswerResult):
+        # 中文：V5 客户端可消费结构化协议；V4 客户端继续读取 answer/citations。
+        # English: V5 clients consume the structured protocol while V4 clients continue to
+        # read answer and citations.
+        protocol = result.verified_protocol
         return ChatResponse(
             trace_id=result.trace_id,
-            status="answered",
+            status=result.status.value,
             answer=result.answer,
             citations=[CitationSchema(**asdict(citation)) for citation in result.citations],
+            items=(
+                [
+                    AnswerItemSchema(
+                        id=item.id,
+                        need_ids=list(item.need_ids),
+                        text=item.text,
+                        claim_ids=list(item.claim_ids),
+                    )
+                    for item in protocol.items
+                ]
+                if protocol is not None
+                else []
+            ),
+            claims=(
+                [
+                    AnswerClaimSchema(
+                        id=claim.id,
+                        text=claim.text,
+                        need_ids=list(claim.need_ids),
+                        evidence_ids=list(claim.evidence_ids),
+                        citation_ids=list(claim.citation_ids),
+                        verification_status=claim.verification_status.value,
+                    )
+                    for claim in protocol.claims
+                ]
+                if protocol is not None
+                else []
+            ),
+            missing_information=(
+                [
+                    MissingInformationSchema(
+                        need_id=item.need_id,
+                        description=item.description,
+                        reason=item.reason.value,
+                    )
+                    for item in protocol.missing_information
+                ]
+                if protocol is not None
+                else []
+            ),
             index_version_id=result.index_version_id,
             retrieval_rounds=result.retrieval_rounds,
         )

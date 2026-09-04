@@ -1,4 +1,4 @@
-config_version: "4.0"
+config_version: "5.0"
 application:
   name: enterprise-trusted-agentic-rag
   environment: production
@@ -27,6 +27,11 @@ ingestion:
   llm_boundary_enabled: false
   llm_boundary_max_calls: 8
   parent_chunks_enabled: true
+  embedding_text_max_tokens: 384
+  index_heading_max_depth: 2
+  index_heading_max_characters: 96
+  max_exact_duplicate_vector_group: 3
+  max_harmful_duplicate_vector_ratio: 0.01
   job_lease_seconds: 300
   job_heartbeat_seconds: 60
   max_request_body_size_mb: 55
@@ -52,13 +57,53 @@ retrieval:
   rrf_k: 60
   min_k: 3
   default_k: 5
-  max_k: 10
+  max_k: 16
   reranker_enabled: true
   reranker_model: BAAI/bge-reranker-base
   context_token_budget: 6000
   max_parent_tokens: 1600
   max_children_per_parent: 2
   max_document_share: 0.6
+
+content_contract:
+  schema_version: source-contract-v1
+  automatic_profile_min_confidence: 0.70
+  profile_mismatch_confidence: 0.80
+  default_enforcement_mode: warn
+  profiler_min_sample_characters: 2000
+  profiler_max_sample_characters: 30000
+
+snapshot:
+  ttl_seconds: 120
+  maximum_ttl_seconds: 300
+  cleanup_grace_seconds: 30
+
+question_plan:
+  schema_version: question-plan-v1
+  max_total_needs: 16
+  max_required_needs: 12
+  max_anchors: 32
+  max_dependency_depth: 4
+  maximum_rewrite_drift: 0.75
+
+providers:
+  allow_lexical_only_publication: true
+  executor_workers: 4
+  executor_queue_capacity: 8
+  circuit_breaker_failure_threshold: 5
+  circuit_breaker_reset_seconds: 30
+
+traces:
+  default_level: summary
+  summary_retention_days: 30
+  diagnostic_retention_days: 14
+  ranked_candidate_limit: 100
+
+compatibility:
+  api_v1_enabled: true
+  legacy_profile_read_enabled: true
+  legacy_status_projection_enabled: true
+  write_legacy_status_during_transition: true
 
 agent:
   max_retrieval_retries: 2

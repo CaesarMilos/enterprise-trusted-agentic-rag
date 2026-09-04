@@ -14,6 +14,7 @@ from enterprise_rag.agent.intent_router import IntentRouter
 from enterprise_rag.agent.orchestrator import AgentOrchestrator
 from enterprise_rag.agent.query_rewriter import QueryRewriter
 from enterprise_rag.agent.state import AgentState
+from enterprise_rag.core.enums import AnswerStatus
 from enterprise_rag.domain.models import Chunk, RetrievalScope
 from enterprise_rag.domain.protocols.models import ModelResponse, ModelUsage
 from enterprise_rag.domain.results import AnswerResult, RefusalResult
@@ -210,3 +211,35 @@ def test_agent_stops_after_initial_plus_two_retrievals() -> None:
     assert isinstance(result, RefusalResult)
     assert len(calls) == 3
     assert [round_number for _, round_number in calls] == [1, 2, 3]
+
+
+def test_agent_returns_structured_partial_answer_for_supported_need() -> None:
+    """中文：多 Need 问题只回答完整支持项，并显式返回未解决项。
+
+    English: A multi-need question answers fully supported needs and discloses unresolved ones.
+    """
+
+    provider = FakeLLM(["设备维护前必须断开设备电源[C1]。"])
+    retrieve = lambda query, round_number: _evidence(  # noqa: E731
+        "设备维护前必须断开设备电源。"
+    )
+    orchestrator = AgentOrchestrator(
+        IntentRouter(),
+        retrieve,
+        EvidenceGrader(minimum_coverage=0.3),
+        QueryRewriter(provider),
+        AnswerGenerator(provider),
+        CitationVerifier(minimum_claim_overlap=0.2),
+        max_retrieval_retries=0,
+        max_model_calls=4,
+        max_total_tokens=1000,
+    )
+
+    result = orchestrator.run(_state("请分别说明设备维护前断电和数据库备份要求，并给出引用"))
+
+    assert isinstance(result, AnswerResult)
+    assert result.status is AnswerStatus.PARTIAL
+    assert result.verified_protocol is not None
+    assert result.verified_protocol.status is AnswerStatus.PARTIAL
+    assert result.verified_protocol.claims[0].citation_ids == ("C1",)
+    assert result.verified_protocol.missing_information[0].need_id == "need-2"

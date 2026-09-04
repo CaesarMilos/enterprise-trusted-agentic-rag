@@ -48,9 +48,7 @@ class SourceRouter:
         # 其精确定义与约束见下方英文说明。
         # English: Query terms use the same bilingual tokenizer as lexical retrieval.
         query_terms = frozenset(lexical_tokens(query.normalized_text))
-        query_terms = frozenset(
-            term for term in query_terms if len(term) > 1 or ":" in term
-        )
+        query_terms = frozenset(term for term in query_terms if len(term) > 1 or ":" in term)
         # 中文：变量 `scores` 用于保存“`scores`”相关数据；其精确定义与约束见下方英文说明。
         # English: Score combines name, description, and derived profile term overlap.
         scores: dict[str, float] = {}
@@ -95,8 +93,7 @@ class SourceRouter:
                 source_ids=tuple(ranked),
                 mode="authorized_global",
                 reason=(
-                    "Source routing signal was weak or ambiguous; searched all authorized "
-                    "sources."
+                    "Source routing signal was weak or ambiguous; searched all authorized sources."
                 ),
                 scores=scores,
             )
@@ -113,8 +110,7 @@ class SourceRouter:
                 source_ids=tuple(ranked),
                 mode="authorized_global",
                 reason=(
-                    "Too many sources were similarly plausible; searched all authorized "
-                    "sources."
+                    "Too many sources were similarly plausible; searched all authorized sources."
                 ),
                 scores=scores,
             )

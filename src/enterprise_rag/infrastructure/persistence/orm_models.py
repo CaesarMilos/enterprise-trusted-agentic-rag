@@ -21,7 +21,18 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from enterprise_rag.core.enums import ContentProfile, DocumentStatus, IndexStatus, JobStatus
+from enterprise_rag.core.enums import (
+    ContentProfile,
+    DocumentLifecycleStatus,
+    DocumentStatus,
+    DocumentVersionStatus,
+    IndexStatus,
+    JobExecutionStatus,
+    JobStatus,
+    JobType,
+    SnapshotStatus,
+    TraceLevel,
+)
 from enterprise_rag.domain.models import utc_now
 
 
@@ -85,6 +96,11 @@ class SourceRow(Base):
     # 中文：高级管理员可选的策略覆盖；默认由内容画像注册表解析。
     # English: Optional advanced strategy override; profiles resolve it by default.
     chunk_strategy_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 中文：V5 内容契约保留为 JSON，旧画像字段在兼容期继续双读。
+    # English: V5 content contract uses JSON while the legacy profile remains dual-readable.
+    contract_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    contract_schema_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    contract_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 中文：变量 `visibility` 用于保存“`visibility`”相关数据；其精确定义与约束见下方英文说明。
     # English: SourceVisibility serialized value.
     visibility: Mapped[str] = mapped_column(String(32))
@@ -125,6 +141,16 @@ class DocumentRow(Base):
     # 中文：变量 `status` 用于保存“状态”相关数据；其精确定义与约束见下方英文说明。
     # English: Serialized DocumentStatus value.
     status: Mapped[str] = mapped_column(String(32), default=DocumentStatus.PENDING.value)
+    # 中文：V5 逻辑生命周期与旧综合状态分列保存，迁移期保持双写。
+    # English: V5 logical lifecycle is stored separately from the legacy aggregate status.
+    lifecycle_status: Mapped[str | None] = mapped_column(
+        String(32),
+        default=DocumentLifecycleStatus.ACTIVE.value,
+        nullable=True,
+    )
+    # 中文：运行期原子版本分配只修改该计数器，禁止再查询 max(version)。
+    # English: Runtime version allocation atomically updates this counter, never max(version).
+    next_version_number: Mapped[int | None] = mapped_column(Integer, default=2, nullable=True)
     # 中文：变量 `active_version_id` 用于保存“活动版本标识符”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Active immutable version, intentionally added without circular foreign-key
@@ -202,6 +228,17 @@ class DocumentVersionRow(Base):
     # 中文：变量 `ingestion_snapshot` 冻结内容画像、策略、模型与质量指标。
     # English: `ingestion_snapshot` freezes profile, strategy, model, and quality metadata.
     ingestion_snapshot: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    # 中文：V5 发布状态、最终内容契约和画像决策独立于旧摄取快照。
+    # English: V5 publication, resolved contract, and profile decision are independent fields.
+    publication_status: Mapped[str | None] = mapped_column(
+        String(32),
+        default=DocumentVersionStatus.CANDIDATE.value,
+        nullable=True,
+    )
+    resolved_contract_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    profile_decision_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    quality_report_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    provenance_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
     # 中文：变量 `created_at` 用于保存“`created``at`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Audit creation time.
@@ -283,6 +320,16 @@ class ChunkRow(Base):
     # 其精确定义与约束见下方英文说明。
     # English: Safe parser-specific metadata.
     extra_metadata: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    # 中文：V5 三层坐标和结构身份允许回答反查到原始文件。
+    # English: V5 three-layer locators and structure identity trace answers to source files.
+    original_locator_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    display_locator_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    normalized_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    normalized_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    locator_mapping_quality: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    structure_node_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    structure_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hard_boundary_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
 
 class IngestionJobRow(Base):
@@ -294,6 +341,13 @@ class IngestionJobRow(Base):
     __tablename__ = "ingestion_jobs"
     __table_args__ = (
         CheckConstraint("attempt_count >= 0", name="ck_ingestion_jobs_attempt_nonnegative"),
+        CheckConstraint("max_attempts >= 1", name="ck_ingestion_jobs_max_attempts_positive"),
+        UniqueConstraint(
+            "tenant_id",
+            "job_type",
+            "idempotency_key",
+            name="uq_job_tenant_type_idempotency",
+        ),
         Index("ix_jobs_claim", "status", "lease_expires_at", "created_at"),
     )
 
@@ -319,6 +373,23 @@ class IngestionJobRow(Base):
     # 中文：变量 `status` 用于保存“状态”相关数据；其精确定义与约束见下方英文说明。
     # English: Serialized JobStatus value.
     status: Mapped[str] = mapped_column(String(32), default=JobStatus.PENDING.value)
+    # 中文：V5 执行状态和任务类型与旧 ingestion-only 状态兼容并行。
+    # English: V5 execution state and job kind coexist with the legacy ingestion-only state.
+    execution_status: Mapped[str | None] = mapped_column(
+        String(32),
+        default=JobExecutionStatus.QUEUED.value,
+        nullable=True,
+    )
+    job_type: Mapped[str] = mapped_column(
+        String(32),
+        default=JobType.INGESTION.value,
+        nullable=False,
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # 中文：变量 `attempt_count` 用于保存“`attempt``count`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Number of worker claims.
@@ -389,6 +460,10 @@ class IndexVersionRow(Base):
     # 其精确定义与约束见下方英文说明。
     # English: Configuration and model fingerprint.
     config_fingerprint: Mapped[str] = mapped_column(String(128))
+    # 中文：Manifest Schema 与内容指纹用于发布 CAS 和兼容审计。
+    # English: Manifest schema and fingerprint support publication CAS and compatibility audit.
+    manifest_schema_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    manifest_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 中文：变量 `created_at` 用于保存“`created``at`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Snapshot creation time.
@@ -404,9 +479,7 @@ class IndexVersionRow(Base):
     # English: Failed and cancelled candidates persist terminal reasons and never remain STAGING.
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class TraceRow(Base):
@@ -437,6 +510,16 @@ class TraceRow(Base):
     # 其精确定义与约束见下方英文说明。
     # English: Pinned immutable index snapshot when applicable.
     index_version_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # 中文：追踪级别、过期时间和快照身份共同限制诊断数据暴露。
+    # English: Trace level, expiry, and snapshot identity constrain diagnostic-data exposure.
+    trace_level: Mapped[str] = mapped_column(
+        String(32), default=TraceLevel.SUMMARY.value, nullable=False
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    redaction_version: Mapped[str] = mapped_column(
+        String(64), default="trace-redaction-v1", nullable=False
+    )
+    snapshot_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     # 中文：变量 `attributes` 用于保存“`attributes`”相关数据；其精确定义与约束见下方英文说明。
     # English: Safe structured trace attributes.
     attributes: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
@@ -451,3 +534,131 @@ class TraceRow(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+
+class QualityReportRow(Base):
+    """中文：持久化与任务执行状态分离的不可变质量报告。
+
+    English: Persist an immutable quality report separated from job execution status.
+    """
+
+    __tablename__ = "quality_reports"
+    __table_args__ = (UniqueConstraint("document_version_id", name="uq_quality_report_version"),)
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
+    document_version_id: Mapped[str] = mapped_column(ForeignKey("document_versions.id"), index=True)
+    decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    metrics_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    findings_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
+    degradation_codes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    validator_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class TenantKnowledgeStateRow(Base):
+    """中文：保存租户严格递增的知识撤销 epoch。
+
+    English: Persist a tenant's strictly increasing knowledge revocation epoch.
+    """
+
+    __tablename__ = "tenant_knowledge_state"
+
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
+    revocation_epoch: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class QuerySnapshotRow(Base):
+    """中文：持久化一次问答固定的授权和索引快照租约。
+
+    English: Persist the authorization and index snapshot lease fixed for one query.
+    """
+
+    __tablename__ = "query_snapshots"
+    __table_args__ = (
+        Index("ix_snapshot_expiry", "tenant_id", "status", "expires_at"),
+        Index("ix_snapshot_index", "tenant_id", "index_version_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(
+        String(32), default=SnapshotStatus.ACTIVE.value, nullable=False
+    )
+    index_version_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    index_manifest_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    authorization_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    captured_revocation_epoch: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class QuerySnapshotDocumentVersionRow(Base):
+    """中文：规范化保存快照允许的精确文档版本集合。
+
+    English: Normalize the exact document versions permitted by a snapshot.
+    """
+
+    __tablename__ = "query_snapshot_document_versions"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "document_version_id", name="uq_snapshot_document_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("query_snapshots.id", ondelete="CASCADE"), index=True
+    )
+    document_version_id: Mapped[str] = mapped_column(ForeignKey("document_versions.id"), index=True)
+    source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), index=True)
+
+
+class RevocationRow(Base):
+    """中文：持久化即时覆盖查询快照的知识撤销事件。
+
+    English: Persist knowledge revocations that immediately override query snapshots.
+    """
+
+    __tablename__ = "revocations"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "epoch", name="uq_revocation_tenant_epoch"),
+        Index("ix_revocation_scope", "tenant_id", "scope_type", "scope_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class OperationalEventRow(Base):
+    """中文：持久化状态、发布、撤销和人工操作的脱敏审计事件。
+
+    English: Persist redacted audit events for state, publication, revocation, and manual actions.
+    """
+
+    __tablename__ = "operational_events"
+    __table_args__ = (Index("ix_operational_events_tenant_time", "tenant_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    from_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    to_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    attributes_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

@@ -1,5 +1,5 @@
-# 中文：V4 生产编排默认使用 JWT；API 只在内部网络暴露，外部入口仅为安全网关。
-# English: V4 production defaults to JWT; only the gateway is public and the API stays internal.
+# 中文：V5 生产编排默认使用 JWT；API 只在内部网络暴露，外部入口仅为安全网关。
+# English: V5 production defaults to JWT; only the gateway is public and the API stays internal.
 services:
   gateway:
     image: nginx:1.27.5-alpine

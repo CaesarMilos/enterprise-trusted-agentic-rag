@@ -88,6 +88,10 @@ class StructuredUnit:
     # 中文：变量 `source_end_offset` 是清洗后规范文本中的结束字符位置。
     # English: End character offset in the normalized cleaned document.
     source_end_offset: int = 0
+    # 中文：关键变量 `hard_boundary_key` 在切块前携带法条、步骤或故障项边界。
+    # English: Key variable `hard_boundary_key` carries clause, step, or fault boundaries
+    # before chunk assembly begins.
+    hard_boundary_key: str | None = None
 
 
 class StructureParser:
@@ -137,6 +141,11 @@ class StructureParser:
                         retrieval_text=" > ".join(heading_stack),
                         source_start_offset=source_offset,
                         source_end_offset=source_offset + len(block.text),
+                        hard_boundary_key=(
+                            str(block.metadata["hard_boundary_key"])
+                            if block.metadata.get("hard_boundary_key") is not None
+                            else None
+                        ),
                     )
                 )
                 source_offset += len(block.text) + 1
@@ -175,6 +184,11 @@ class StructureParser:
                         retrieval_text=retrieval_text,
                         source_start_offset=source_offset + local_start,
                         source_end_offset=source_offset + local_end,
+                        hard_boundary_key=(
+                            str(block.metadata["hard_boundary_key"])
+                            if block.metadata.get("hard_boundary_key") is not None
+                            else None
+                        ),
                     )
                 )
             source_offset += len(block.text) + 1

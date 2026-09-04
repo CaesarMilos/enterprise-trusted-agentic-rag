@@ -32,6 +32,10 @@ RUN uv sync --frozen --no-dev --extra local-models --extra ocr --no-editable
 
 COPY configs ./configs
 COPY scripts ./scripts
+# 中文：生产镜像必须携带正式迁移链，才能在启动前独立执行 Alembic。
+# English: Production images must contain the formal migration chain for pre-start Alembic runs.
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 RUN mkdir -p /app/data /app/.cache \
     && groupadd --gid 10001 rag \
     && useradd --uid 10001 --gid rag --no-create-home --shell /usr/sbin/nologin rag \

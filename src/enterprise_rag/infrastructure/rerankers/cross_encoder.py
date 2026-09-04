@@ -41,7 +41,13 @@ class CrossEncoderReranker:
 
         return f"cross-encoder:{self._model_name}"
 
-    def score(self, query: str, passages: Sequence[str]) -> Sequence[float]:
+    def score(
+        self,
+        query: str,
+        passages: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Sequence[float]:
         """中文：该函数或方法负责“计算相关性分数”相关处理。
 
         English: Return one float score per query-passage pair.
@@ -49,6 +55,10 @@ class CrossEncoderReranker:
 
         # 中文：变量 `pairs` 用于保存“`pairs`”相关数据；其精确定义与约束见下方英文说明。
         # English: Pair ordering mirrors passage input ordering.
+        # 中文：CrossEncoder 不支持安全中断，硬截止由共享有界执行器实施。
+        # English: CrossEncoder has no safe interruption API; a shared bounded executor enforces
+        # the hard response deadline.
+        _ = timeout_seconds
         pairs = [(query, passage) for passage in passages]
         scores = self._get_model().predict(pairs, show_progress_bar=False)
         return tuple(float(score) for score in scores)

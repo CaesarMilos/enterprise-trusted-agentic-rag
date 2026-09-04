@@ -84,10 +84,31 @@ class LeaseLostError(ConflictError):
     """
 
 
+class LeaseOwnershipLostError(LeaseLostError):
+    """中文：报告任务租约已经由另一个 Worker 或 generation 接管。
+
+    English: Report that another worker or lease generation now owns the job.
+    """
+
+
+class LeaseExpiredError(LeaseLostError):
+    """中文：报告当前 Worker 的任务租约已超过持久化到期时间。
+
+    English: Report that the worker's durable job lease has expired.
+    """
+
+
 class LifecycleFenceError(ConflictError):
     """中文：报告任务持有的文档 generation 已失效，禁止任何后续写入或发布。
 
     English: Report that a job's document generation is stale and may no longer write or publish.
+    """
+
+
+class DocumentGenerationStaleError(LifecycleFenceError):
+    """中文：报告任务创建时冻结的文档 generation 已失效。
+
+    English: Report that the document generation frozen by the job is stale.
     """
 
 
@@ -158,6 +179,90 @@ class OperationTimeoutError(EnterpriseRAGError):
     """中文：该类用于表示或实现“操作超时错误（OperationTimeoutError）”的职责。
 
     English: Report that a bounded workflow exceeded its deadline.
+    """
+
+
+class InvalidStateTransitionError(ConflictError):
+    """中文：报告领域状态机不允许请求的状态跃迁。
+
+    English: Report a transition rejected by a domain state machine.
+    """
+
+
+class TransitionAuthorityError(PermissionDeniedError):
+    """中文：报告调用组件无权修改目标状态机。
+
+    English: Report that the calling component may not mutate the target state machine.
+    """
+
+
+class ContractValidationError(ValidationError):
+    """中文：报告资料源内容契约缺少必需字段或违反不变量。
+
+    English: Report a source contract missing required fields or violating invariants.
+    """
+
+
+class ProfileMismatchError(ValidationError):
+    """中文：报告文档结构与资料源显式内容契约高置信度不匹配。
+
+    English: Report a high-confidence mismatch with an explicit source content contract.
+    """
+
+
+class InvalidLocatorError(ValidationError):
+    """中文：报告引用无法映射到合法原文或展示坐标。
+
+    English: Report a citation that cannot map to a valid source or display location.
+    """
+
+
+class InvalidQuestionPlanError(ValidationError):
+    """中文：报告问题计划违反信息需要、锚点或依赖约束。
+
+    English: Report a question plan violating need, anchor, or dependency constraints.
+    """
+
+
+class InvalidEvidenceCoverageError(ValidationError):
+    """中文：报告证据评分向量与问题计划不一致。
+
+    English: Report evidence grades inconsistent with the question plan.
+    """
+
+
+class InvalidAnswerProtocolError(ValidationError):
+    """中文：报告最终回答包含未验证 Claim、悬空引用或非法状态组合。
+
+    English: Report unverified claims, dangling citations, or invalid answer-state combinations.
+    """
+
+
+class SnapshotExpiredError(ConflictError):
+    """中文：报告查询知识快照已经超过最大租约时间。
+
+    English: Report that a query knowledge snapshot exceeded its maximum lease time.
+    """
+
+
+class SnapshotRevokedError(PermissionDeniedError):
+    """中文：报告固定快照中的资料源、文档或版本已被即时撤销。
+
+    English: Report immediate revocation of a source, document, or version in a snapshot.
+    """
+
+
+class SnapshotScopeError(PermissionDeniedError):
+    """中文：报告候选证据不属于请求固定的知识快照。
+
+    English: Report candidate evidence outside the request's fixed knowledge snapshot.
+    """
+
+
+class MigrationStateError(EnterpriseRAGError):
+    """中文：报告数据库迁移版本不满足安全启动或数据兼容要求。
+
+    English: Report a database revision unsafe for startup or data compatibility.
     """
 
 

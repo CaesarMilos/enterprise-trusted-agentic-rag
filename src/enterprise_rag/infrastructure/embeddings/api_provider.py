@@ -56,7 +56,12 @@ class APIEmbeddingProvider:
 
         return f"openai-compatible-embedding:{self._model}"
 
-    def embed(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Sequence[Sequence[float]]:
         """中文：该函数或方法负责“向量化”相关处理。
 
         English: Return vectors reordered by the response index field.
@@ -80,7 +85,12 @@ class APIEmbeddingProvider:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+            request_timeout = (
+                self._timeout_seconds
+                if timeout_seconds is None
+                else max(0.001, min(float(self._timeout_seconds), timeout_seconds))
+            )
+            with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise RuntimeError("embedding API request failed") from exc

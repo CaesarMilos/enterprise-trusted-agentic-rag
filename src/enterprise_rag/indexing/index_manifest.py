@@ -34,6 +34,17 @@ def create_manifest(plan: IndexBuildPlan, artifacts: tuple[Path, ...]) -> IndexM
         str(path.relative_to(common_parent)): content_sha256(path.read_bytes())
         for path in sorted(artifacts)
     }
+    # 中文：变量 `vector_quality_report` 从同一暂存目录读取并随 Manifest 冻结。
+    # English: Variable `vector_quality_report` is read from staging and frozen with the manifest.
+    vector_quality_path = next(
+        (path for path in artifacts if path.name == "vector_quality.json"),
+        None,
+    )
+    vector_quality_report = (
+        json.loads(vector_quality_path.read_text(encoding="utf-8"))
+        if vector_quality_path is not None
+        else {}
+    )
     return IndexManifest(
         index_version_id=plan.index_version_id,
         tenant_id=plan.tenant_id,
@@ -42,6 +53,18 @@ def create_manifest(plan: IndexBuildPlan, artifacts: tuple[Path, ...]) -> IndexM
         chunker_version=plan.chunker_version,
         config_fingerprint=plan.config_fingerprint,
         artifact_checksums=checksums,
+        schema_version="index-manifest-v5.1",
+        tokenizer_fingerprint=plan.tokenizer_fingerprint,
+        normalizer_fingerprint=plan.normalizer_fingerprint,
+        chunk_strategy_id=plan.chunk_strategy_id,
+        reranker_fingerprint=plan.reranker_fingerprint,
+        content_profiles=plan.content_profiles,
+        child_content_hashes=dict(plan.child_content_hashes),
+        parent_child_mapping_fingerprint=plan.parent_child_mapping_fingerprint,
+        build_parameters_fingerprint=plan.build_parameters_fingerprint,
+        source_document_fingerprints=dict(plan.source_document_fingerprints),
+        index_text_strategy_version=plan.index_text_strategy_version,
+        vector_quality_report=vector_quality_report,
     )
 
 
@@ -81,6 +104,30 @@ def load_manifest(directory: Path) -> IndexManifest:
         config_fingerprint=str(payload["config_fingerprint"]),
         artifact_checksums={
             str(path): str(checksum) for path, checksum in payload["artifact_checksums"].items()
+        },
+        schema_version=str(payload.get("schema_version", "index-manifest-v4")),
+        tokenizer_fingerprint=str(payload.get("tokenizer_fingerprint", "unicode-codepoint-v1")),
+        normalizer_fingerprint=str(payload.get("normalizer_fingerprint", "query-normalizer-v1")),
+        chunk_strategy_id=str(payload.get("chunk_strategy_id", payload["chunker_version"])),
+        reranker_fingerprint=str(payload.get("reranker_fingerprint", "not-part-of-index")),
+        content_profiles=tuple(payload.get("content_profiles", ())),
+        child_content_hashes={
+            str(identifier): str(checksum)
+            for identifier, checksum in payload.get("child_content_hashes", {}).items()
+        },
+        parent_child_mapping_fingerprint=str(payload.get("parent_child_mapping_fingerprint", "")),
+        build_parameters_fingerprint=str(
+            payload.get("build_parameters_fingerprint", payload["config_fingerprint"])
+        ),
+        source_document_fingerprints={
+            str(identifier): str(checksum)
+            for identifier, checksum in payload.get("source_document_fingerprints", {}).items()
+        },
+        index_text_strategy_version=str(
+            payload.get("index_text_strategy_version", "legacy-single-text")
+        ),
+        vector_quality_report={
+            str(key): value for key, value in payload.get("vector_quality_report", {}).items()
         },
         created_at=datetime.fromisoformat(payload["created_at"]),
     )

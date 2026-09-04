@@ -108,9 +108,7 @@ class PDFLoader:
         )
         # 中文：关键变量 `missing_pages` 精确列出缺少可用文本层的物理页。
         # English: Key variable `missing_pages` identifies every physical page lacking usable text.
-        missing_pages = tuple(
-            block.page_number for block in blocks if len(block.text.strip()) < 5
-        )
+        missing_pages = tuple(block.page_number for block in blocks if len(block.text.strip()) < 5)
         if not blocks or missing_pages:
             if self._ocr_provider is not None:
                 # 中文：变量 `ocr_result` 包含按页排序文字、置信度与提供方版本。

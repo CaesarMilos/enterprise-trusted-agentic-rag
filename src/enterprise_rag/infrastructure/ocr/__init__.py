@@ -2,4 +2,3 @@
 
 English: Provide replaceable OCR infrastructure adapters.
 """
-

@@ -7,8 +7,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from enterprise_rag.core.deadline import DeadlineBudget
 from enterprise_rag.domain.models import Chunk
 from enterprise_rag.domain.protocols.models import RerankerProvider
+from enterprise_rag.indexing.provider_invocation import rerank_with_timeout
 from enterprise_rag.retrieval.models import RetrievalCandidate
 
 
@@ -33,6 +35,7 @@ class CandidateReranker:
         query: str,
         candidates: tuple[RetrievalCandidate, ...],
         chunks: Mapping[str, Chunk],
+        deadline: DeadlineBudget | None = None,
     ) -> tuple[tuple[RetrievalCandidate, ...], bool]:
         """中文：该函数或方法负责“重排”相关处理。
 
@@ -54,7 +57,15 @@ class CandidateReranker:
         # English: Reranking sees headings, identifiers, and child body without repeated parents.
         passages = tuple(chunks[candidate.chunk_id].search_text for candidate in valid_candidates)
         try:
-            scores = self._provider.score(query, passages)
+            timeout_seconds = (
+                deadline.timeout_for_call("reranker_provider") if deadline is not None else None
+            )
+            scores = rerank_with_timeout(
+                self._provider,
+                query,
+                passages,
+                timeout_seconds,
+            )
             if len(scores) != len(valid_candidates):
                 raise ValueError("reranker score count does not match candidate count")
         except Exception:

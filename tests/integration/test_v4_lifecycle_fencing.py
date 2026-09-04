@@ -95,9 +95,7 @@ def test_delete_generation_cancels_and_fences_running_job(tmp_path: Path) -> Non
         repositories.mark_job_cancelled(fence, datetime.now(UTC), "document_deleted")
     with transactional_session(sessions) as session:
         repositories = SQLAlchemyRepositories(session)
-        repositories.complete_document_deletion(
-            "tenant-a", "document-a", 1, datetime.now(UTC)
-        )
+        repositories.complete_document_deletion("tenant-a", "document-a", 1, datetime.now(UTC))
         document = repositories.get_document("tenant-a", "document-a")
         job = repositories.get_job("tenant-a", "job-a")
         assert document is not None and document.status is DocumentStatus.DELETED

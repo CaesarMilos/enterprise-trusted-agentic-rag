@@ -25,8 +25,10 @@ from enterprise_rag.agent.evidence_grader import EvidenceGrader
 from enterprise_rag.agent.intent_router import IntentRouter
 from enterprise_rag.agent.orchestrator import AgentOrchestrator
 from enterprise_rag.agent.query_rewriter import QueryRewriter
+from enterprise_rag.agent.question_planner import QuestionPlanner, QuestionPlanningPolicy
+from enterprise_rag.core.concurrency import BoundedExecutor
 from enterprise_rag.core.config import Settings, load_settings
-from enterprise_rag.core.enums import AuthenticationMode
+from enterprise_rag.core.enums import AuthenticationMode, DocumentStatus
 from enterprise_rag.core.ids import content_sha256
 from enterprise_rag.domain.models import Chunk, RetrievalScope, UserContext
 from enterprise_rag.domain.protocols.models import EmbeddingProvider
@@ -35,6 +37,7 @@ from enterprise_rag.indexing.embedding_service import EmbeddingService
 from enterprise_rag.indexing.index_coordinator import IndexCoordinator
 from enterprise_rag.indexing.source_catalog import SourceCatalogBuilder
 from enterprise_rag.indexing.vector_index import VectorIndexBuilder
+from enterprise_rag.indexing.vector_quality import VectorQualityValidator
 from enterprise_rag.infrastructure.embeddings.api_provider import APIEmbeddingProvider
 from enterprise_rag.infrastructure.embeddings.local_provider import LocalEmbeddingProvider
 from enterprise_rag.infrastructure.indexes.index_runtime import LocalIndexRuntime
@@ -46,6 +49,7 @@ from enterprise_rag.infrastructure.persistence.database import (
     initialize_database,
     transactional_session,
 )
+from enterprise_rag.infrastructure.persistence.migrations import assert_database_current
 from enterprise_rag.infrastructure.persistence.repositories import SQLAlchemyRepositories
 from enterprise_rag.infrastructure.rerankers.cross_encoder import CrossEncoderReranker
 from enterprise_rag.infrastructure.storage.local_file_store import LocalFileStore
@@ -166,7 +170,14 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         configured.storage.database_url,
         echo=configured.application.debug,
     )
-    initialize_database(engine)
+    if configured.application.environment == "production":
+        # 中文：生产进程只验证 revision，禁止监听端口时暗中修改数据库结构。
+        # English: Production processes verify the revision and never mutate schema at startup.
+        assert_database_current(engine)
+    else:
+        # 中文：开发、测试和评测环境允许显式执行受版本控制的 Alembic 升级。
+        # English: Development, test, and evaluation may run version-controlled Alembic upgrades.
+        initialize_database(engine)
     sessions = create_session_factory(engine)
     # 中文：变量 `file_store` 用于保存“文件存储”相关数据；其精确定义与约束见下方英文说明。
     # English: Original file adapter owns tenant-isolated upload paths.
@@ -276,6 +287,10 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         VectorIndexBuilder(),
         BM25IndexBuilder(),
         SourceCatalogBuilder(),
+        VectorQualityValidator(
+            configured.ingestion.max_exact_duplicate_vector_group,
+            configured.ingestion.max_harmful_duplicate_vector_ratio,
+        ),
     )
     # 中文：变量 `config_fingerprint` 用于保存“配置指纹”相关数据；
     # 其精确定义与约束见下方英文说明。
@@ -293,11 +308,27 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         embeddings.fingerprint,
         configured.ingestion.chunker_version,
         config_fingerprint,
+        configured.ingestion.embedding_text_max_tokens,
+        configured.ingestion.index_heading_max_depth,
+        configured.ingestion.index_heading_max_characters,
     )
+
+    def cleanup_document_files(tenant_id: str, storage_keys: tuple[str, ...]) -> None:
+        """中文：按不可变存储键精确清理某文档的全部原始版本。
+
+        English: Delete every original version by exact immutable storage key.
+        """
+
+        for storage_key in storage_keys:
+            file_store.delete(tenant_id, storage_key)
+
     knowledge_service = KnowledgeService(
         sessions,
-        index_service.rebuild_active,
+        # 中文：删除最后一份文档时必须发布空快照，确保旧索引不再可检索。
+        # English: Deleting the last document must publish an empty snapshot to revoke old data.
+        lambda tenant_id: index_service.rebuild_active(tenant_id, allow_empty=True),
         strategy_registry,
+        cleanup_document_files,
     )
     ingestion_service = IngestionService(
         sessions,
@@ -341,16 +372,65 @@ def build_container(settings: Settings | None = None) -> AppContainer:
 
     # 中文：函数 `load_chunks` 用于执行“加载文本块”相关处理；其精确定义与约束见下方英文说明。
     # English: Tenant-scoped chunk callback creates a short independent read transaction.
-    def load_chunks(tenant_id: str, chunk_ids: Sequence[str]) -> tuple[Chunk, ...]:
+    def load_chunks(
+        tenant_id: str,
+        chunk_ids: Sequence[str],
+        document_version_ids: frozenset[str] | None = None,
+    ) -> tuple[Chunk, ...]:
         """中文：该函数或方法负责“加载文本块”相关处理。
 
         English: Load only currently retrievable chunks for fused candidate IDs.
         """
 
         with transactional_session(sessions) as session:
-            return tuple(
-                SQLAlchemyRepositories(session).get_retrievable_chunks(tenant_id, chunk_ids)
+            repositories = SQLAlchemyRepositories(session)
+            if document_version_ids:
+                return tuple(
+                    repositories.get_snapshot_chunks(
+                        tenant_id,
+                        chunk_ids,
+                        document_version_ids,
+                    )
+                )
+            return tuple(repositories.get_retrievable_chunks(tenant_id, chunk_ids))
+
+    def citation_is_current(item: object, scope: RetrievalScope) -> bool:
+        """中文：回答返回前重查 Source 撤权和文档删除，但容许正常版本切换。
+
+        English: Recheck source revocation and document deletion before return while allowing
+        ordinary version switches.
+        """
+
+        from enterprise_rag.retrieval.models import EvidenceItem
+
+        if not isinstance(item, EvidenceItem) or not scope.allows(
+            item.chunk.tenant_id,
+            item.chunk.source_id,
+            item.chunk.document_id,
+        ):
+            return False
+        with transactional_session(sessions) as session:
+            repositories = SQLAlchemyRepositories(session)
+            source = repositories.get_source(scope.tenant_id, item.chunk.source_id)
+            document = repositories.get_document(scope.tenant_id, item.chunk.document_id)
+            version = repositories.get_version(scope.tenant_id, item.chunk.document_version_id)
+            return bool(
+                source is not None
+                and source.is_active
+                and document is not None
+                and document.status is DocumentStatus.READY
+                and version is not None
+                and version.document_id == document.id
             )
+
+    # 中文：所有请求共享有界 Provider 池，超时调用无法通过新建线程池无限累积。
+    # English: All requests share one bounded provider pool so timed-out calls cannot accumulate
+    # through per-request executors.
+    provider_executor = BoundedExecutor(
+        configured.providers.executor_workers,
+        configured.providers.executor_queue_capacity,
+        "rag-provider",
+    )
 
     def orchestrator_factory(scope: RetrievalScope) -> AgentOrchestrator:
         """中文：该函数或方法负责“编排器工厂”相关处理。
@@ -383,22 +463,42 @@ def build_container(settings: Settings | None = None) -> AppContainer:
                 max_document_share=configured.retrieval.max_document_share,
             ),
             ContextBuilder(),
-            load_chunks,
+            lambda tenant_id, chunk_ids: load_chunks(
+                tenant_id,
+                chunk_ids,
+                scope.document_version_ids,
+            ),
             ParentExpander(
                 configured.retrieval.max_parent_tokens,
                 configured.retrieval.context_token_budget,
             ),
+            provider_executor,
         )
         return AgentOrchestrator(
             IntentRouter(),
-            lambda query, round_number: hybrid.retrieve(query, scope, round_number),
+            lambda query, round_number, deadline, plan: hybrid.retrieve(
+                query,
+                scope,
+                round_number,
+                deadline,
+                plan,
+            ),
             EvidenceGrader(),
-            QueryRewriter(llm),
+            QueryRewriter(llm, configured.question_plan.maximum_rewrite_drift),
             AnswerGenerator(llm),
-            CitationVerifier(),
+            CitationVerifier(current_access_validator=citation_is_current),
             configured.agent.max_retrieval_retries,
             configured.agent.max_model_calls,
             configured.agent.max_total_tokens,
+            QuestionPlanner(
+                QuestionPlanningPolicy(
+                    schema_version=configured.question_plan.schema_version,
+                    max_total_needs=configured.question_plan.max_total_needs,
+                    max_required_needs=configured.question_plan.max_required_needs,
+                    max_anchors=configured.question_plan.max_anchors,
+                    max_dependency_depth=configured.question_plan.max_dependency_depth,
+                )
+            ),
         )
 
     trace_recorder = JSONLTraceRecorder(configured.storage.trace_dir)
@@ -407,6 +507,7 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         orchestrator_factory,
         trace_recorder,
         configured.agent.timeout_seconds,
+        configured.snapshot.ttl_seconds,
     )
     # 中文：关键变量 `worker_identity` 区分同机进程和容器，便于租约审计。
     # English: Key variable `worker_identity` distinguishes host processes and containers for
@@ -420,6 +521,7 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         worker_id=worker_identity,
         lease_seconds=configured.ingestion.job_lease_seconds,
         heartbeat_seconds=configured.ingestion.job_heartbeat_seconds,
+        process_deletion=knowledge_service.process_deletion_job,
     )
     return AppContainer(
         settings=configured,
@@ -450,9 +552,7 @@ def get_user_context(
     source_ids: Annotated[str | None, Header(alias="X-Source-IDs")] = None,
     group_ids: Annotated[str | None, Header(alias="X-Group-IDs")] = None,
     proxy_secret: Annotated[str | None, Header(alias="X-Auth-Proxy-Secret")] = None,
-    gateway_secret: Annotated[
-        str | None, Header(alias="X-Enterprise-RAG-Proxy-Secret")
-    ] = None,
+    gateway_secret: Annotated[str | None, Header(alias="X-Enterprise-RAG-Proxy-Secret")] = None,
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
 ) -> UserContext:
     """中文：该函数或方法负责“获取用户上下文”相关处理。
@@ -475,9 +575,7 @@ def get_user_context(
                 detail="Trusted proxy authentication is not fully configured.",
             )
         supplied_secret = gateway_secret or proxy_secret
-        if supplied_secret is None or not secrets.compare_digest(
-            supplied_secret, expected_secret
-        ):
+        if supplied_secret is None or not secrets.compare_digest(supplied_secret, expected_secret):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Trusted proxy authentication failed.",

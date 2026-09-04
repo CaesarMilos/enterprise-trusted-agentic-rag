@@ -56,6 +56,43 @@ class CitationSchema(APISchema):
     excerpt: str | None
 
 
+class AnswerClaimSchema(APISchema):
+    """中文：展示一条已经绑定 Need、Evidence 与 Citation 的可审计结论。
+
+    English: Expose one auditable claim bound to needs, evidence, and citations.
+    """
+
+    id: str
+    text: str
+    need_ids: list[str]
+    evidence_ids: list[str]
+    citation_ids: list[str]
+    verification_status: str
+
+
+class AnswerItemSchema(APISchema):
+    """中文：展示一个面向用户的回答项及其 Claim 标识。
+
+    English: Expose one user-facing answer item and its claim identities.
+    """
+
+    id: str
+    need_ids: list[str]
+    text: str
+    claim_ids: list[str]
+
+
+class MissingInformationSchema(APISchema):
+    """中文：披露部分回答中尚未得到充分证据支持的信息需要。
+
+    English: Disclose an information need not sufficiently supported in a partial answer.
+    """
+
+    need_id: str
+    description: str
+    reason: str
+
+
 class ChatRequest(APISchema):
     """中文：该类用于表示或实现“问答请求（ChatRequest）”的职责。
 
@@ -85,7 +122,7 @@ class ChatResponse(APISchema):
     # English: Stable request trace identifier.
     trace_id: str
     # 中文：变量 `status` 用于保存“状态”相关数据；其精确定义与约束见下方英文说明。
-    # English: answered or refused.
+    # English: answered, partial, or refused.
     status: str
     # 中文：变量 `answer` 用于保存“答案”相关数据；其精确定义与约束见下方英文说明。
     # English: Verified answer text when answered.
@@ -93,6 +130,15 @@ class ChatResponse(APISchema):
     # 中文：变量 `citations` 用于保存“引用”相关数据；其精确定义与约束见下方英文说明。
     # English: Verified citations.
     citations: list[CitationSchema] = Field(default_factory=list)
+    # 中文：结构化回答项用于 UI 分项展示，并保持旧 `answer` 字段兼容。
+    # English: Structured items support itemized UI rendering while preserving `answer`.
+    items: list[AnswerItemSchema] = Field(default_factory=list)
+    # 中文：每条 Claim 必须已经通过引用验证并绑定证据。
+    # English: Every exposed claim has passed citation verification and evidence binding.
+    claims: list[AnswerClaimSchema] = Field(default_factory=list)
+    # 中文：仅部分回答携带缺失信息，完整回答保持空列表。
+    # English: Only partial answers carry missing information; complete answers keep it empty.
+    missing_information: list[MissingInformationSchema] = Field(default_factory=list)
     # 中文：变量 `refusal_reason` 用于保存“拒答原因”相关数据；其精确定义与约束见下方英文说明。
     # English: Machine-readable refusal reason when refused.
     refusal_reason: str | None = None
@@ -128,6 +174,33 @@ class IngestionAcceptedSchema(APISchema):
     # 中文：变量 `status` 用于保存“状态”相关数据；其精确定义与约束见下方英文说明。
     # English: Initial document state.
     status: str
+
+
+class DeletionAcceptedSchema(APISchema):
+    """中文：返回可轮询的异步删除任务标识。
+
+    English: Return a pollable asynchronous deletion job identity.
+    """
+
+    deletion_job_id: str
+    document_id: str
+    status: str
+
+
+class JobDetailSchema(APISchema):
+    """中文：展示通用后台任务的安全状态投影。
+
+    English: Expose a safe projection of any durable background job.
+    """
+
+    job_id: str
+    job_type: str
+    document_id: str
+    document_version_id: str
+    status: str
+    attempt_count: int
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 class DocumentDetailSchema(APISchema):
@@ -276,6 +349,12 @@ class TraceSchema(APISchema):
     # 中文：变量 `status` 用于保存“状态”相关数据；其精确定义与约束见下方英文说明。
     # English: Final workflow status.
     status: str
+    # 中文：回答使用的不可变索引版本标识。
+    # English: Immutable index version used by the answer.
+    index_version_id: str | None
+    # 中文：回答使用的查询快照标识。
+    # English: Query snapshot identity used by the answer.
+    snapshot_id: str | None
     # 中文：变量 `steps` 用于保存“`steps`”相关数据；其精确定义与约束见下方英文说明。
     # English: Ordered safe step mappings.
     steps: list[dict[str, object]]

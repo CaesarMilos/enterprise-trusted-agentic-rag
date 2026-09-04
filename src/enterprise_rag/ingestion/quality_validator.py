@@ -5,12 +5,20 @@ English: Assess cleaning/chunk output and prevent clearly unsafe content enterin
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from enterprise_rag.core.enums import ContentProfile, ErrorCategory
 from enterprise_rag.core.exceptions import ChunkValidationError, ParsingError, error_detail
 from enterprise_rag.domain.models import Chunk
 from enterprise_rag.ingestion.cleaner import CleanedDocument
+
+# 中文：仅识别行首法条定义，避免把正文中的交叉引用误判为跨条切块。
+# English: Match article definitions only at line starts to avoid confusing cross-references
+# with cross-article chunks.
+_ARTICLE_DEFINITION = re.compile(
+    r"(?m)^\s*(第\s*[零〇一二两三四五六七八九十百千万亿0-9]+\s*条)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +85,29 @@ class ChunkQualityValidator:
             self._fail("empty_chunk", "The chunk set contains empty text.")
         if any(chunk.token_count > self._max_chunk_tokens for chunk in leaf_chunks):
             self._fail("oversized_chunk", "A leaf chunk exceeds the configured hard token limit.")
+        if content_profile is ContentProfile.REGULATION:
+            # 中文：关键变量 `article_definitions` 对每个叶子块统计真正定义的法条；
+            # 单块出现多个条号意味着法规硬边界已被跨越。
+            # English: Key variable `article_definitions` counts declared articles per leaf;
+            # multiple definitions prove that an article boundary was crossed.
+            for chunk in leaf_chunks:
+                article_definitions = {
+                    re.sub(r"\s+", "", match)
+                    for match in _ARTICLE_DEFINITION.findall(chunk.text)
+                }
+                if len(article_definitions) > 1:
+                    self._fail(
+                        "regulation_hard_boundary_crossed",
+                        "A regulation leaf chunk contains more than one article definition.",
+                    )
+                if article_definitions and not (
+                    chunk.hard_boundary_key
+                    and chunk.hard_boundary_key.startswith("article:")
+                ):
+                    self._fail(
+                        "regulation_boundary_key_missing",
+                        "A regulation article chunk is missing its stable hard-boundary key.",
+                    )
         if any(
             chunk.page_start is not None
             and chunk.page_end is not None
@@ -117,6 +148,26 @@ class ChunkQualityValidator:
         duplicate_ratio = 1.0 - len({chunk.content_hash for chunk in leaf_chunks}) / len(
             leaf_chunks
         )
+        # 中文：关键变量 `retrieval_prefix_groups` 检测完整哈希无法发现的长前缀复制；
+        # 仅对至少四个不同正文哈希共享的 320 字符前缀执行阻断。
+        # English: Key variable `retrieval_prefix_groups` catches long-prefix replication missed
+        # by full hashes and blocks only groups spanning four distinct bodies.
+        retrieval_prefix_groups: dict[str, set[str]] = {}
+        for chunk in leaf_chunks:
+            compact_retrieval = re.sub(r"\s+", " ", chunk.search_text).strip()
+            if len(compact_retrieval) >= 320:
+                retrieval_prefix_groups.setdefault(compact_retrieval[:320], set()).add(
+                    chunk.content_hash
+                )
+        largest_repeated_prefix_group = max(
+            (len(hashes) for hashes in retrieval_prefix_groups.values()),
+            default=0,
+        )
+        if content_profile is ContentProfile.REGULATION and largest_repeated_prefix_group >= 4:
+            self._fail(
+                "repeated_regulation_retrieval_prefix",
+                "Distinct regulation chunks repeat an unsafe long retrieval prefix.",
+            )
         if len(leaf_chunks) >= 5 and duplicate_ratio >= 0.5:
             warnings.append("high_duplicate_content_ratio")
         if len(leaf_chunks) >= 10 and duplicate_ratio >= 0.8:
@@ -155,6 +206,7 @@ class ChunkQualityValidator:
             "tiny_chunk_count": tiny_chunk_count,
             "tiny_chunk_ratio": round(tiny_ratio, 4),
             "duplicate_content_ratio": round(duplicate_ratio, 4),
+            "largest_repeated_prefix_group": largest_repeated_prefix_group,
             "average_chunk_tokens": round(
                 sum(chunk.token_count for chunk in leaf_chunks) / len(leaf_chunks), 2
             ),

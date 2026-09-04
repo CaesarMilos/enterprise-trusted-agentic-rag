@@ -56,7 +56,12 @@ class EmbeddingProvider(Protocol):
         English: Return a stable provider, model, and dimension fingerprint.
         """
 
-    def embed(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Sequence[Sequence[float]]:
         """中文：该函数或方法负责“向量化”相关处理。
 
         English: Embed an ordered text batch and preserve input order.
@@ -103,7 +108,13 @@ class RerankerProvider(Protocol):
         English: Return a stable provider and model fingerprint.
         """
 
-    def score(self, query: str, passages: Sequence[str]) -> Sequence[float]:
+    def score(
+        self,
+        query: str,
+        passages: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Sequence[float]:
         """中文：该函数或方法负责“计算相关性分数”相关处理。
 
         English: Return one relevance score for each passage in input order.

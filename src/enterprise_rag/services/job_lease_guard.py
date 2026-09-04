@@ -12,8 +12,15 @@ from types import TracebackType
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from enterprise_rag.core.enums import ErrorCategory
-from enterprise_rag.core.exceptions import LeaseLostError, error_detail
+from enterprise_rag.core.enums import ErrorCategory, LeaseCheckResult
+from enterprise_rag.core.exceptions import (
+    DocumentGenerationStaleError,
+    JobCancelledError,
+    LeaseExpiredError,
+    LeaseLostError,
+    LeaseOwnershipLostError,
+    error_detail,
+)
 from enterprise_rag.domain.models import JobFence
 from enterprise_rag.infrastructure.persistence.database import transactional_session
 from enterprise_rag.infrastructure.persistence.repositories import SQLAlchemyRepositories
@@ -63,6 +70,9 @@ class JobLeaseGuard:
         # English: The state lock protects the error reason and thread reference.
         self._state_lock = Lock()
         self._failure_reason = "lease renewal was rejected"
+        # 中文：关键变量 `_failure_result` 保留后台心跳看到的精确失败类别。
+        # English: Key variable `_failure_result` preserves the exact heartbeat failure class.
+        self._failure_result = LeaseCheckResult.VALID
         self._thread: Thread | None = None
 
     def __enter__(self) -> JobLeaseGuard:
@@ -117,8 +127,29 @@ class JobLeaseGuard:
         try:
             with transactional_session(self._sessions) as session:
                 SQLAlchemyRepositories(session).assert_job_fence(self._fence, now)
+        except JobCancelledError:
+            self._record_lease_loss(
+                LeaseCheckResult.CANCEL_REQUESTED,
+                "the synchronous checkpoint observed cancellation",
+            )
+            raise
+        except DocumentGenerationStaleError:
+            self._record_lease_loss(
+                LeaseCheckResult.DOCUMENT_GENERATION_STALE,
+                "the synchronous checkpoint observed a stale document generation",
+            )
+            raise
+        except LeaseExpiredError:
+            self._record_lease_loss(
+                LeaseCheckResult.LEASE_EXPIRED,
+                "the synchronous checkpoint observed an expired lease",
+            )
+            raise
         except LeaseLostError:
-            self._record_lease_loss("the synchronous fencing checkpoint was rejected")
+            self._record_lease_loss(
+                LeaseCheckResult.LEASE_OWNERSHIP_LOST,
+                "the synchronous fencing checkpoint was rejected",
+            )
             raise
 
     def stop(self) -> None:
@@ -143,28 +174,35 @@ class JobLeaseGuard:
             now = datetime.now(UTC)
             try:
                 with transactional_session(self._sessions) as session:
-                    renewed = SQLAlchemyRepositories(session).renew_job_lease(
+                    result = SQLAlchemyRepositories(session).renew_job_lease_result(
                         self._fence,
                         now,
                         now + timedelta(seconds=self._lease_seconds),
                     )
-                if not renewed:
-                    self._record_lease_loss("the background lease renewal was rejected")
+                if result is not LeaseCheckResult.VALID:
+                    self._record_lease_loss(
+                        result,
+                        "the background lease renewal was rejected",
+                    )
                     return
             except Exception:
                 # 中文：数据库不可达时不能假定仍持有租约，安全策略是停止一切后续提交。
                 # English: A database outage cannot prove ownership, so all later commits stop.
-                self._record_lease_loss("the background lease renewal failed")
+                self._record_lease_loss(
+                    LeaseCheckResult.LEASE_OWNERSHIP_LOST,
+                    "the background lease renewal failed",
+                )
                 return
 
-    def _record_lease_loss(self, reason: str) -> None:
-        """中文：原子记录首次失租原因并通知主 Worker。
+    def _record_lease_loss(self, result: LeaseCheckResult, reason: str) -> None:
+        """中文：原子记录首次租约检查结果并通知主 Worker。
 
-        English: Record the first lease-loss reason atomically and notify the main worker.
+        English: Record the first lease-check outcome atomically and notify the main worker.
         """
 
         with self._state_lock:
             if not self._lease_lost_event.is_set():
+                self._failure_result = result
                 self._failure_reason = reason
                 self._lease_lost_event.set()
 
@@ -176,7 +214,37 @@ class JobLeaseGuard:
 
         if not self._lease_lost_event.is_set():
             return
-        raise LeaseLostError(
+        if self._failure_result is LeaseCheckResult.CANCEL_REQUESTED:
+            raise JobCancelledError(
+                error_detail(
+                    "INGESTION_CANCELLED",
+                    ErrorCategory.CONFLICT,
+                    "The ingestion job was cancelled before publication.",
+                    job_id=self._fence.job_id,
+                    reason=self._failure_reason,
+                )
+            )
+        if self._failure_result is LeaseCheckResult.DOCUMENT_GENERATION_STALE:
+            raise DocumentGenerationStaleError(
+                error_detail(
+                    "DOCUMENT_GENERATION_STALE",
+                    ErrorCategory.CONFLICT,
+                    "The document lifecycle invalidated this ingestion attempt.",
+                    document_id=self._fence.document_id,
+                    reason=self._failure_reason,
+                )
+            )
+        if self._failure_result is LeaseCheckResult.LEASE_EXPIRED:
+            raise LeaseExpiredError(
+                error_detail(
+                    "INGESTION_LEASE_EXPIRED",
+                    ErrorCategory.CONFLICT,
+                    "The ingestion worker lease expired.",
+                    job_id=self._fence.job_id,
+                    reason=self._failure_reason,
+                )
+            )
+        raise LeaseOwnershipLostError(
             error_detail(
                 "INGESTION_LEASE_LOST",
                 ErrorCategory.CONFLICT,

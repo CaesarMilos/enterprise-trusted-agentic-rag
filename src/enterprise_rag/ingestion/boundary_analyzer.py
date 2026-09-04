@@ -65,6 +65,36 @@ class BoundaryDecision:
     features: dict[str, float] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class EmbeddingPreparationResult:
+    """中文：记录整篇文档采用向量模式或确定性词法降级模式。
+
+    English: Record whether one complete document uses embeddings or deterministic lexical
+    fallback.
+    """
+
+    # 中文：`mode` 只能是 embedding 或 lexical_fallback，禁止同文档混用。
+    # English: `mode` is embedding or lexical_fallback; a document never mixes both modes.
+    mode: str
+    # 中文：`model_fingerprint` 标识实际尝试使用的向量模型。
+    # English: `model_fingerprint` identifies the embedding model that was attempted.
+    model_fingerprint: str | None
+    # 中文：`failure_code` 是不包含敏感提供方消息的稳定降级原因。
+    # English: `failure_code` is a stable degradation reason without provider secrets.
+    failure_code: str | None = None
+
+    def __post_init__(self) -> None:
+        """中文：拒绝无法审计的模式值与不一致的失败码。
+
+        English: Reject unauditable mode values and inconsistent failure codes.
+        """
+
+        if self.mode not in {"embedding", "lexical_fallback"}:
+            raise ValueError("embedding preparation mode is invalid")
+        if self.mode == "embedding" and self.failure_code is not None:
+            raise ValueError("successful embedding preparation cannot contain a failure code")
+
+
 @dataclass(slots=True)
 class BoundaryReviewBudget:
     """中文：按真实模型请求次数限制单文档 LLM 边界复核成本。
@@ -143,20 +173,65 @@ class EmbeddingSimilarity:
         # 中文：文档级向量缓存由 prepare 批量填充，边界循环只进行内存余弦计算。
         # English: Document cache is batch-filled by prepare; boundary loops use in-memory cosine.
         self._cache: dict[str, Sequence[float]] = {}
+        # 中文：文档模式在批量预取时一次确定，边界循环不得局部切换算法。
+        # English: Document mode is decided once during prefetch and never changes per boundary.
+        self._preparation = EmbeddingPreparationResult(
+            mode="embedding",
+            model_fingerprint=getattr(provider, "fingerprint", None),
+        )
 
-    def prepare(self, texts: Sequence[str]) -> None:
-        """中文：对去重后的未缓存单元一次批量 Embedding，消除逐边界网络调用。
+    @property
+    def preparation(self) -> EmbeddingPreparationResult:
+        """中文：返回当前文档冻结的向量准备结果。
 
-        English: Batch-embed unique uncached units once, eliminating per-boundary provider calls.
+        English: Return the frozen embedding-preparation result for the current document.
         """
 
-        missing = tuple(dict.fromkeys(text for text in texts if text and text not in self._cache))
-        if not missing:
-            return
-        vectors = self._provider.embed(missing)
-        if len(vectors) != len(missing):
-            raise ValueError("embedding provider returned an unexpected vector count")
-        self._cache.update(zip(missing, vectors, strict=True))
+        return self._preparation
+
+    @property
+    def cache_size(self) -> int:
+        """中文：返回当前文档缓存条目数，用于容量测试与运行诊断。
+
+        English: Return current document-cache entries for capacity tests and diagnostics.
+        """
+
+        return len(self._cache)
+
+    def prepare(self, texts: Sequence[str]) -> EmbeddingPreparationResult:
+        """中文：整篇批量预取；任一失败都让整篇统一使用词法算法。
+
+        English: Prefetch the whole document; any failure switches the whole document to lexical
+        fallback.
+        """
+
+        self._cache.clear()
+        unique_texts = tuple(dict.fromkeys(text for text in texts if text))
+        try:
+            vectors = self._provider.embed(unique_texts) if unique_texts else ()
+            if len(vectors) != len(unique_texts):
+                raise ValueError("embedding provider returned an unexpected vector count")
+            self._cache.update(zip(unique_texts, vectors, strict=True))
+            self._preparation = EmbeddingPreparationResult(
+                mode="embedding",
+                model_fingerprint=getattr(self._provider, "fingerprint", None),
+            )
+        except Exception:
+            self._cache.clear()
+            self._preparation = EmbeddingPreparationResult(
+                mode="lexical_fallback",
+                model_fingerprint=getattr(self._provider, "fingerprint", None),
+                failure_code="embedding_prepare_failed",
+            )
+        return self._preparation
+
+    def release_document_cache(self) -> None:
+        """中文：在文档切块完成后立即释放全部向量，禁止跨文档无界增长。
+
+        English: Release every vector after document chunking to prevent cross-document growth.
+        """
+
+        self._cache.clear()
 
     def similarity(self, left: str, right: str) -> float:
         """中文：计算左右文本向量的安全余弦相似度。
@@ -164,7 +239,10 @@ class EmbeddingSimilarity:
         English: Compute a numerically safe cosine similarity for the two passages.
         """
 
-        self.prepare((left, right))
+        if self._preparation.mode != "embedding":
+            return _lexical_cosine(left, right)
+        if left not in self._cache or right not in self._cache:
+            raise KeyError("text was not included in the document embedding prefetch")
         return _vector_cosine(self._cache[left], self._cache[right])
 
     def semantic_continuity(self, left_texts: Sequence[str], right: str) -> float:
@@ -176,7 +254,10 @@ class EmbeddingSimilarity:
         usable_left = tuple(text for text in left_texts if text)
         if not usable_left or not right:
             return 0.0
-        self.prepare(usable_left + (right,))
+        if self._preparation.mode != "embedding":
+            return _lexical_cosine(usable_left[-1], right)
+        if any(text not in self._cache for text in (*usable_left, right)):
+            raise KeyError("text was not included in the document embedding prefetch")
         right_vector = self._cache[right]
         last_similarity = _vector_cosine(self._cache[usable_left[-1]], right_vector)
         dimension = len(right_vector)
@@ -231,7 +312,7 @@ class LLMBoundaryJudge:
             "你是文档结构边界判定器。只输出 JSON，不回答文档内容。/ "
             "You are a document boundary classifier. Return JSON only.",
             (
-                '判断 RIGHT 是否开启独立主题或结构块。返回 '
+                "判断 RIGHT 是否开启独立主题或结构块。返回 "
                 '{"split":true|false,"confidence":0..1}。\n'
                 f"LEFT:\n{left[-half:]}\n\nRIGHT:\n{right[:half]}"
             ),
@@ -297,8 +378,15 @@ class AdaptiveBoundaryAnalyzer:
             base_threshold=base_boundary_threshold,
             weights=boundary_weights,
         )
+        # 中文：关键变量 `_preparation` 冻结当前文档的统一相似度模式。
+        # English: Key variable `_preparation` freezes one similarity mode for this document.
+        self._preparation = (
+            EmbeddingPreparationResult("embedding", None)
+            if similarity_provider is not None
+            else EmbeddingPreparationResult("lexical_fallback", None, "embedding_not_configured")
+        )
 
-    def prepare(self, units: Sequence[StructuredUnit]) -> None:
+    def prepare(self, units: Sequence[StructuredUnit]) -> EmbeddingPreparationResult:
         """中文：在边界循环前批量准备语义向量；不支持预取的回退实现无需处理。
 
         English: Batch-prepare semantic vectors before boundary iteration when supported.
@@ -306,7 +394,26 @@ class AdaptiveBoundaryAnalyzer:
 
         prepare = getattr(self._similarity, "prepare", None)
         if callable(prepare):
-            prepare(tuple(unit.retrieval_text or unit.text for unit in units))
+            result = prepare(tuple(unit.retrieval_text or unit.text for unit in units))
+            if isinstance(result, EmbeddingPreparationResult):
+                self._preparation = result
+                return result
+        self._preparation = (
+            EmbeddingPreparationResult("embedding", None)
+            if self._similarity is not None
+            else EmbeddingPreparationResult("lexical_fallback", None, "embedding_not_configured")
+        )
+        return self._preparation
+
+    def release_document_cache(self) -> None:
+        """中文：通知相似度提供方释放当前文档缓存。
+
+        English: Ask the similarity provider to release its current document cache.
+        """
+
+        release = getattr(self._similarity, "release_document_cache", None)
+        if callable(release):
+            release()
 
     def decide(
         self,
@@ -348,8 +455,9 @@ class AdaptiveBoundaryAnalyzer:
         # English: Key variable `similarity_fallback` records lexical degradation after a
         # similarity-provider error.
         similarity_fallback: str | None = None
-        if self._similarity is None:
+        if self._similarity is None or self._preparation.mode == "lexical_fallback":
             similarity = _lexical_cosine(left_text, right_text)
+            similarity_fallback = self._preparation.failure_code
         else:
             try:
                 semantic_continuity = getattr(self._similarity, "semantic_continuity", None)
@@ -434,9 +542,7 @@ class AdaptiveBoundaryAnalyzer:
             "llm_invalid_json": "llm_invalid_json_fallback",
             "llm_budget_exhausted": "llm_budget_exhausted",
         }
-        fallback_method = fallback_methods.get(
-            llm_fallback_reason, "adaptive_score_ambiguous"
-        )
+        fallback_method = fallback_methods.get(llm_fallback_reason, "adaptive_score_ambiguous")
         return BoundaryDecision(
             should_split,
             fallback_method,

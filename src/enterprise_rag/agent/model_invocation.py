@@ -1,6 +1,6 @@
 """中文：以向后兼容方式把全局剩余预算传入支持超时参数的模型适配器。
 
-    English: Pass remaining global budget to timeout-aware adapters with compatibility fallback.
+English: Pass remaining global budget to timeout-aware adapters with compatibility fallback.
 """
 
 from __future__ import annotations

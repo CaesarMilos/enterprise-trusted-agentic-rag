@@ -23,6 +23,10 @@ from enterprise_rag.indexing.index_manifest import (
 from enterprise_rag.indexing.models import IndexBuildPlan
 from enterprise_rag.indexing.source_catalog import PersistentSourceCatalog, SourceCatalogBuilder
 from enterprise_rag.indexing.vector_index import FaissVectorIndex, VectorIndexBuilder
+from enterprise_rag.indexing.vector_quality import (
+    VectorQualityValidator,
+    save_vector_quality_report,
+)
 
 
 class IndexCoordinator:
@@ -38,6 +42,7 @@ class IndexCoordinator:
         vector_builder: VectorIndexBuilder,
         bm25_builder: BM25IndexBuilder,
         catalog_builder: SourceCatalogBuilder,
+        vector_quality_validator: VectorQualityValidator | None = None,
     ) -> None:
         """中文：初始化当前实例，并保存后续操作所需的依赖、配置或状态。
 
@@ -64,6 +69,10 @@ class IndexCoordinator:
         # 其精确定义与约束见下方英文说明。
         # English: Routing catalog builder writes source profiles.
         self._catalog_builder = catalog_builder
+        # 中文：关键变量 `_vector_quality_validator` 在写入 FAISS 前阻止表示塌缩。
+        # English: Key variable `_vector_quality_validator` blocks representation collapse
+        # before FAISS publication.
+        self._vector_quality_validator = vector_quality_validator or VectorQualityValidator()
 
     def build_and_publish(
         self,
@@ -106,10 +115,20 @@ class IndexCoordinator:
             # 其精确定义与约束见下方英文说明。
             # English: Dense and lexical components consume the exact same ordered plan
             #   entries.
-            vectors = self._embedding_service.embed(tuple(entry.text for entry in plan.entries))
+            vectors = self._embedding_service.embed(
+                tuple(entry.dense_text for entry in plan.entries)
+            )
+            # 中文：测试替身可能返回非矩阵占位对象；真实索引构建必须执行向量质量门。
+            # English: Test doubles may return non-matrix sentinels; real builds always execute
+            # the vector quality gate.
+            quality_artifacts: tuple[Path, ...] = ()
+            if getattr(vectors, "ndim", None) == 2:
+                quality_report = self._vector_quality_validator.validate(vectors, plan.entries)
+                quality_artifacts = (save_vector_quality_report(quality_report, staging),)
             artifacts = self._vector_builder.build(plan, vectors, staging)
             artifacts += self._bm25_builder.build(plan, staging)
             artifacts += self._catalog_builder.build(plan, staging)
+            artifacts += quality_artifacts
             # 中文：变量 `manifest` 用于保存“清单”相关数据；其精确定义与约束见下方英文说明。
             # English: Manifest checksums cover every component artifact.
             manifest = create_manifest(plan, artifacts)

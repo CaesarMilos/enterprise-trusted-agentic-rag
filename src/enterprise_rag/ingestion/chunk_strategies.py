@@ -17,6 +17,7 @@ from enterprise_rag.ingestion.boundary_analyzer import (
     SimilarityProvider,
 )
 from enterprise_rag.ingestion.chunking.boundary_scorer import BoundaryWeights
+from enterprise_rag.ingestion.regulation_chunker import RegulationChunkStrategy
 from enterprise_rag.ingestion.semantic_chunker import ChunkingContext, DynamicSemanticChunker
 from enterprise_rag.ingestion.structure_parser import StructuredUnit
 
@@ -204,6 +205,7 @@ class ProfileChunkStrategy:
                     retrieval_text=retrieval_text,
                     source_start_offset=unit.source_start_offset,
                     source_end_offset=unit.source_end_offset,
+                    hard_boundary_key=unit.hard_boundary_key,
                 )
             )
         return tuple(profiled)
@@ -327,24 +329,6 @@ def build_default_strategy_registry(
         StructuralRule("config", re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]"), True),
         StructuralRule("parameter", re.compile(r"^(?:参数|返回值|错误码|默认值|类型|必填)"), True),
     )
-    # 中文：法规规则把编章节条设为硬边界，款项保留在同一条父结构下自适应组合。
-    # English: Regulation rules make parts/chapters/articles hard and merge clauses within articles.
-    regulation_rules = (
-        StructuralRule(
-            "heading",
-            re.compile(r"^第\s*[零〇一二两三四五六七八九十百千万亿0-9]+\s*[编章节]"),
-            True,
-        ),
-        StructuralRule(
-            "numbered_clause",
-            re.compile(r"^第\s*[零〇一二两三四五六七八九十百千万亿0-9]+\s*条"),
-            True,
-        ),
-        StructuralRule(
-            "sub_clause",
-            re.compile(r"^(?:第.+款|[（(][一二三四五六七八九十0-9]+[）)])"),
-        ),
-    )
     # 中文：论文画像保护摘要、方法、实验与结论区段，同时允许同小节段落语义合并。
     # English: Academic profile protects abstract/method/results/conclusion sections.
     academic_rules = (
@@ -437,12 +421,9 @@ def build_default_strategy_registry(
             base_boundary_threshold=base_boundary_threshold,
             boundary_weights=boundary_weights,
         ),
-        ProfileChunkStrategy(
+        RegulationChunkStrategy(
             strategy_id="regulation-structure",
-            version="regulation-structure-v4",
-            content_profile=ContentProfile.REGULATION,
-            rules=regulation_rules,
-            hard_boundary_kinds=frozenset({"heading", "numbered_clause"}),
+            version="regulation-structure-v5",
             min_tokens=min_tokens,
             target_tokens=target_tokens,
             max_tokens=max_tokens,

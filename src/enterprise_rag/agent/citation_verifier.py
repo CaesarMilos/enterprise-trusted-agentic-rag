@@ -7,8 +7,10 @@ support.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
+from enterprise_rag.agent.claim_verifier import ClaimVerifier
 from enterprise_rag.domain.models import Citation, RetrievalScope
 from enterprise_rag.indexing.bm25_index import lexical_tokens
 from enterprise_rag.retrieval.models import EvidenceBundle, EvidenceItem
@@ -47,7 +49,11 @@ class CitationVerifier:
     English: Enforce deterministic citation and basic claim-support rules.
     """
 
-    def __init__(self, minimum_claim_overlap: float = 0.15) -> None:
+    def __init__(
+        self,
+        minimum_claim_overlap: float = 0.15,
+        current_access_validator: Callable[[EvidenceItem, RetrievalScope], bool] | None = None,
+    ) -> None:
         """中文：初始化当前实例，并保存后续操作所需的依赖、配置或状态。
 
         English: Store the minimum lexical overlap between a claim and cited evidence.
@@ -57,6 +63,14 @@ class CitationVerifier:
         #   用于保存“`minimum``claim``overlap`”相关数据；其精确定义与约束见下方英文说明。
         # English: Threshold is intentionally configurable for evaluation calibration.
         self._minimum_claim_overlap = minimum_claim_overlap
+        # 中文：最终支撑判定升级为词面与关键语义槽位的联合校验。
+        # English: Final support now combines lexical overlap with critical semantic slots.
+        self._claim_verifier = ClaimVerifier(minimum_claim_overlap)
+        # 中文：可选回调在回答返回前重查删除和 Source 撤权；
+        # 普通索引切换仍允许固定快照完成。
+        # English: The optional callback rechecks deletion and source revocation before return;
+        # ordinary index switches may still complete their pinned snapshot.
+        self._current_access_validator = current_access_validator
 
     def verify(
         self,
@@ -113,18 +127,24 @@ class CitationVerifier:
                 return CitationVerification(False, (), "A claim references unknown evidence.")
             if not all(_authorized(item, scope) for item in cited_items):
                 return CitationVerification(False, (), "A citation is outside the retrieval scope.")
-            # 中文：变量 `evidence_terms` 用于保存“证据`terms`”相关数据；
-            # 其精确定义与约束见下方英文说明。
-            # English: Combined cited terms must lexically support a meaningful part of
-            #   the claim.
-            evidence_terms = frozenset(
-                term
-                for item in cited_items
-                for term in lexical_tokens(item.chunk.retrieval_text or item.chunk.text)
-            )
-            overlap = len(claim_terms & evidence_terms) / len(claim_terms)
-            if overlap < self._minimum_claim_overlap:
-                return CitationVerification(False, (), "A citation does not support its claim.")
+            if self._current_access_validator is not None and not all(
+                self._current_access_validator(item, scope) for item in cited_items
+            ):
+                return CitationVerification(
+                    False,
+                    (),
+                    "A citation was revoked or deleted while the answer was running.",
+                )
+            # 中文：词面相似度不能替代实体、时间、模态、数字和锚点一致性。
+            # English: Lexical similarity cannot substitute for entity, time, modality,
+            # numeric, and exact-anchor consistency.
+            claim_support = self._claim_verifier.verify(claim_text, cited_items)
+            if not claim_support.supported:
+                return CitationVerification(
+                    False,
+                    (),
+                    f"A citation does not support its claim ({claim_support.reason_code}).",
+                )
             for label in labels:
                 support_terms_by_label.setdefault(label, set()).update(claim_terms)
         # 中文：变量 `citations` 用于保存“引用”相关数据；其精确定义与约束见下方英文说明。
@@ -143,7 +163,11 @@ def _authorized(item: EvidenceItem, scope: RetrievalScope) -> bool:
     """
 
     chunk = item.chunk
-    return scope.allows(chunk.tenant_id, chunk.source_id, chunk.document_id)
+    return scope.allows(
+        chunk.tenant_id,
+        chunk.source_id,
+        chunk.document_id,
+    ) and scope.allows_version(chunk.document_version_id)
 
 
 def _to_citation(item: EvidenceItem, support_terms: set[str]) -> Citation:
@@ -188,9 +212,7 @@ def _support_excerpt(text: str, support_terms: set[str], limit: int = 280) -> st
             candidate_starts.add(max(0, position - limit // 3))
     best_start = max(
         candidate_starts,
-        key=lambda start: len(
-            set(lexical_tokens(text[start : start + limit])) & support_terms
-        ),
+        key=lambda start: len(set(lexical_tokens(text[start : start + limit])) & support_terms),
     )
     excerpt = text[best_start : best_start + limit].strip()
     prefix = "…" if best_start > 0 else ""

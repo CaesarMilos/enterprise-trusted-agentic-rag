@@ -112,6 +112,12 @@ class TopKDecision:
     # 中文：最终 Evidence Pack 的估算 Token 数，而非仅 Child 选择阶段的数量。
     # English: Estimated final Evidence Pack tokens after parent expansion.
     final_context_tokens: int = 0
+    # 中文：最终候选至少命中一次的 required Need，用于 Trace 和评测。
+    # English: Required needs with at least one selected lexical/anchor candidate.
+    covered_need_ids: tuple[str, ...] = ()
+    # 中文：在候选或 Token 预算中仍未覆盖的 required Need。
+    # English: Required needs still uncovered by candidates or the token budget.
+    uncovered_need_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +139,34 @@ class EvidenceItem:
     # 中文：`context_chunk` 可为更完整 Parent；`chunk` 始终保持精确可引用 Child。
     # English: `context_chunk` may be a parent; `chunk` always remains the precise citable child.
     context_chunk: Chunk | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RankedCandidateTrace:
+    """中文：保存某一真实检索阶段的 Chunk ID、排名和分数。
+
+    English: Store chunk identity, rank, and score from one actual retrieval stage.
+    """
+
+    chunk_id: str
+    rank: int
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalTrace:
+    """中文：按层保存 Router、Dense、BM25、RRF、Rerank 和最终选择的真实输出。
+
+    English: Preserve real stage outputs for router, dense, BM25, RRF, rerank, and selection.
+    """
+
+    routed_source_ids: tuple[str, ...] = ()
+    dense: tuple[RankedCandidateTrace, ...] = ()
+    bm25: tuple[RankedCandidateTrace, ...] = ()
+    fused: tuple[RankedCandidateTrace, ...] = ()
+    reranked: tuple[RankedCandidateTrace, ...] = ()
+    selected: tuple[RankedCandidateTrace, ...] = ()
+    parent_context_by_child: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,3 +199,6 @@ class EvidenceBundle:
     # 其精确定义与约束见下方英文说明。
     # English: Safe labels describing component degradation.
     degradations: tuple[str, ...] = ()
+    # 中文：分层 Trace 只保存 ID/排名/分数，不复制原文或 Prompt。
+    # English: Stage trace stores IDs/ranks/scores without copying source text or prompts.
+    retrieval_trace: RetrievalTrace | None = None

@@ -10,7 +10,13 @@ from typing import TypedDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from enterprise_rag.core.enums import ContentProfile, DocumentStatus, ErrorCategory, JobStatus
+from enterprise_rag.core.enums import (
+    ContentProfile,
+    DocumentStatus,
+    ErrorCategory,
+    JobStatus,
+    JobType,
+)
 from enterprise_rag.core.exceptions import PermissionDeniedError, ValidationError, error_detail
 from enterprise_rag.core.ids import new_id
 from enterprise_rag.domain.models import Document, DocumentVersion, IngestionJob
@@ -208,6 +214,13 @@ class IngestionService:
         job_id = new_id("job")
         with transactional_session(self._sessions) as session:
             repositories = SQLAlchemyRepositories(session)
+            existing_job = repositories.get_job_by_idempotency(
+                command.user.tenant_id,
+                JobType.INGESTION,
+                command.idempotency_key,
+            )
+            if existing_job is not None:
+                return self._accepted_for_existing_job(repositories, existing_job)
             document = repositories.get_document(
                 command.user.tenant_id,
                 command.document_id,
@@ -275,6 +288,7 @@ class IngestionService:
                     document_version_id=version.id,
                     document_generation_snapshot=document.lifecycle_generation,
                     status=JobStatus.PENDING,
+                    idempotency_key=command.idempotency_key,
                 )
             )
             # 中文：已有活动版本保持 READY；只有从未成功发布过的文档回到 PENDING。
@@ -317,6 +331,13 @@ class IngestionService:
         job_id = new_id("job")
         with transactional_session(self._sessions) as session:
             repositories = SQLAlchemyRepositories(session)
+            existing_job = repositories.get_job_by_idempotency(
+                command.user.tenant_id,
+                JobType.INGESTION,
+                command.idempotency_key,
+            )
+            if existing_job is not None:
+                return self._accepted_for_existing_job(repositories, existing_job)
             document = repositories.get_document(
                 command.user.tenant_id,
                 command.document_id,
@@ -368,7 +389,10 @@ class IngestionService:
                 tenant_id=latest.tenant_id,
                 document_id=latest.document_id,
                 source_id=latest.source_id,
-                version_number=latest.version_number + 1,
+                version_number=repositories.next_version_number(
+                    command.user.tenant_id,
+                    command.document_id,
+                ),
                 original_filename=latest.original_filename,
                 media_type=latest.media_type,
                 content_hash=latest.content_hash,
@@ -388,6 +412,7 @@ class IngestionService:
                     document_version_id=version_id,
                     document_generation_snapshot=document.lifecycle_generation,
                     status=JobStatus.PENDING,
+                    idempotency_key=command.idempotency_key,
                 )
             )
             # 中文：已有活动版本继续保持 READY，新候选版本在任务中独立处理。
@@ -409,6 +434,32 @@ class IngestionService:
             ),
         )
 
+    @staticmethod
+    def _accepted_for_existing_job(
+        repositories: SQLAlchemyRepositories,
+        job: IngestionJob,
+    ) -> IngestionAccepted:
+        """中文：把幂等命中的原任务转换为稳定 202 响应。
+
+        English: Convert an idempotency hit into the same stable asynchronous response.
+        """
+
+        document = repositories.get_document(job.tenant_id, job.document_id)
+        if document is None:
+            raise ValidationError(
+                error_detail(
+                    "IDEMPOTENT_JOB_DOCUMENT_MISSING",
+                    ErrorCategory.VALIDATION,
+                    "The idempotent job no longer has a logical document.",
+                )
+            )
+        return IngestionAccepted(
+            document_id=job.document_id,
+            document_version_id=job.document_version_id,
+            job_id=job.id,
+            status=document.status.value,
+        )
+
     def _snapshot_fields(
         self,
         content_profile: ContentProfile,
@@ -427,14 +478,17 @@ class IngestionService:
         else:
             # 中文：兼容简化单元测试构造方式；生产容器始终注入注册表。
             # English: Preserve simple unit-test construction; production always injects registry.
-            strategy_id = strategy_override or {
-                ContentProfile.GENERAL_PROSE: "general-prose",
-                ContentProfile.MANUAL: "manual-structure",
-                ContentProfile.TECHNICAL_DOC: "technical-document",
-                ContentProfile.REGULATION: "regulation-structure",
-                ContentProfile.ACADEMIC: "academic-structure",
-                ContentProfile.NARRATIVE: "narrative-structure",
-            }[profile]
+            strategy_id = (
+                strategy_override
+                or {
+                    ContentProfile.GENERAL_PROSE: "general-prose",
+                    ContentProfile.MANUAL: "manual-structure",
+                    ContentProfile.TECHNICAL_DOC: "technical-document",
+                    ContentProfile.REGULATION: "regulation-structure",
+                    ContentProfile.ACADEMIC: "academic-structure",
+                    ContentProfile.NARRATIVE: "narrative-structure",
+                }[profile]
+            )
             strategy_version = f"{strategy_id}-v4"
         return {
             "content_profile": profile,

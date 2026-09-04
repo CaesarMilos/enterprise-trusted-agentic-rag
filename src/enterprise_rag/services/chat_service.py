@@ -12,13 +12,14 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from enterprise_rag.agent.orchestrator import AgentOrchestrator
 from enterprise_rag.agent.state import AgentState
-from enterprise_rag.core.enums import ErrorCategory, SourceVisibility
+from enterprise_rag.core.enums import ErrorCategory, SnapshotStatus, SourceVisibility
 from enterprise_rag.core.exceptions import PermissionDeniedError, RetrievalError, error_detail
-from enterprise_rag.core.ids import new_id
+from enterprise_rag.core.ids import content_sha256, new_id
 from enterprise_rag.domain.models import RetrievalScope, Source, TraceRecord
 from enterprise_rag.domain.protocols.observability import TraceRecorder
 from enterprise_rag.domain.requests import ChatCommand
 from enterprise_rag.domain.results import AnswerResult, RefusalResult
+from enterprise_rag.domain.snapshots import KnowledgeSnapshot
 from enterprise_rag.infrastructure.persistence.database import transactional_session
 from enterprise_rag.infrastructure.persistence.repositories import SQLAlchemyRepositories
 
@@ -35,6 +36,7 @@ class ChatService:
         orchestrator_factory: Callable[[RetrievalScope], AgentOrchestrator],
         trace_recorder: TraceRecorder,
         timeout_seconds: int,
+        snapshot_ttl_seconds: int = 120,
     ) -> None:
         """中文：初始化当前实例，并保存后续操作所需的依赖、配置或状态。
 
@@ -59,6 +61,9 @@ class ChatService:
         # 其精确定义与约束见下方英文说明。
         # English: Complete workflow wall-clock deadline.
         self._timeout_seconds = timeout_seconds
+        # 中文：快照 TTL 限制崩溃请求阻塞物理清理的最长时间。
+        # English: Snapshot TTL bounds how long a crashed request may delay physical cleanup.
+        self._snapshot_ttl_seconds = snapshot_ttl_seconds
 
     def chat(self, command: ChatCommand) -> AnswerResult | RefusalResult:
         """中文：该函数或方法负责“问答”相关处理。
@@ -91,7 +96,11 @@ class ChatService:
             operation="chat",
             status="started",
             index_version_id=scope.index_version_id,
-            attributes={"source_count": len(scope.source_ids)},
+            snapshot_id=scope.snapshot_id,
+            attributes={
+                "source_count": len(scope.source_ids),
+                "document_version_count": len(scope.document_version_ids),
+            },
         )
         with transactional_session(self._sessions) as session:
             SQLAlchemyRepositories(session).add_trace(trace_record)
@@ -129,6 +138,14 @@ class ChatService:
             )
             self._finish_trace(command.user.tenant_id, trace_id, "error", metrics)
             raise
+        finally:
+            if scope.snapshot_id is not None:
+                with transactional_session(self._sessions) as session:
+                    SQLAlchemyRepositories(session).close_knowledge_snapshot(
+                        command.user.tenant_id,
+                        scope.snapshot_id,
+                        datetime.now(UTC),
+                    )
 
     def _finish_trace(
         self,
@@ -198,11 +215,62 @@ class ChatService:
                         "No active knowledge index is available for this tenant.",
                     )
                 )
-            return RetrievalScope(
+            active_versions = tuple(repositories.list_active_versions(command.user.tenant_id))
+            pinned_version_ids = frozenset(
+                version.id for version in active_versions if version.source_id in authorized
+            )
+            if not pinned_version_ids:
+                raise RetrievalError(
+                    error_detail(
+                        "AUTHORIZED_DOCUMENT_VERSION_NOT_FOUND",
+                        ErrorCategory.RETRIEVAL,
+                        "No active document version is available in the authorized scope.",
+                    )
+                )
+            snapshot_id = new_id("snp")
+            created_at = datetime.now(UTC)
+            scope = RetrievalScope(
                 tenant_id=command.user.tenant_id,
                 source_ids=authorized,
                 index_version_id=active_index.id,
+                document_version_ids=pinned_version_ids,
+                snapshot_id=snapshot_id,
             )
+            authorization_fingerprint = content_sha256(
+                "\0".join(
+                    (
+                        command.user.user_id,
+                        *sorted(command.user.roles),
+                        *sorted(command.user.group_ids),
+                        *sorted(authorized),
+                    )
+                )
+            )
+            snapshot = KnowledgeSnapshot(
+                id=snapshot_id,
+                tenant_id=command.user.tenant_id,
+                user_id=command.user.user_id,
+                status=SnapshotStatus.ACTIVE,
+                index_version_id=active_index.id,
+                index_manifest_fingerprint=(active_index.config_fingerprint or active_index.id),
+                source_ids=authorized,
+                document_version_ids=pinned_version_ids,
+                authorization_fingerprint=authorization_fingerprint,
+                captured_revocation_epoch=repositories.current_revocation_epoch(
+                    command.user.tenant_id
+                ),
+                created_at=created_at,
+                expires_at=created_at + timedelta(seconds=self._snapshot_ttl_seconds),
+            )
+            repositories.add_knowledge_snapshot(
+                snapshot,
+                {
+                    version.id: version.source_id
+                    for version in active_versions
+                    if version.id in pinned_version_ids
+                },
+            )
+            return scope
 
 
 def _source_allowed(command: ChatCommand, source: Source) -> bool:

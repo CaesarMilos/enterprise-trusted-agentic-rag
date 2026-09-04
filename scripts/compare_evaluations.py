@@ -1,6 +1,6 @@
-"""中文：比较固定数据集的基线与 V4 候选评测报告并执行发布门禁。
+"""中文：比较固定数据集的基线与 V5 候选评测报告并执行发布门禁。
 
-English: Compare baseline and V4 candidate reports from one fixed dataset and enforce gates.
+English: Compare baseline and V5 candidate reports from one fixed dataset and enforce gates.
 """
 
 from __future__ import annotations

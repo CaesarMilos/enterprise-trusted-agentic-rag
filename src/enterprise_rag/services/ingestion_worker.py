@@ -11,15 +11,18 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from enterprise_rag.core.enums import DocumentStatus, JobStatus
+from enterprise_rag.core.enums import DocumentStatus, JobStatus, JobType, QualityDecision
 from enterprise_rag.core.exceptions import (
+    DocumentGenerationStaleError,
     EnterpriseRAGError,
     JobCancelledError,
     LeaseLostError,
     LifecycleFenceError,
 )
-from enterprise_rag.domain.models import JobFence, job_fence_from_job
+from enterprise_rag.core.ids import stable_id
+from enterprise_rag.domain.models import Chunk, IngestionJob, JobFence, job_fence_from_job
 from enterprise_rag.domain.protocols.storage import FileStore
+from enterprise_rag.domain.quality import IngestionQualityReport, QualityFinding
 from enterprise_rag.infrastructure.persistence.database import transactional_session
 from enterprise_rag.infrastructure.persistence.repositories import SQLAlchemyRepositories
 from enterprise_rag.ingestion.pipeline import IngestionPipeline
@@ -42,6 +45,7 @@ class IngestionWorker:
         worker_id: str,
         lease_seconds: int,
         heartbeat_seconds: int,
+        process_deletion: Callable[[IngestionJob, JobFence], None] | None = None,
     ) -> None:
         """中文：初始化当前实例，并保存后续操作所需的依赖、配置或状态。
 
@@ -75,6 +79,9 @@ class IngestionWorker:
         # 中文：关键变量 `_heartbeat_seconds` 控制长任务的主动续租间隔。
         # English: Key variable `_heartbeat_seconds` controls active renewal for long jobs.
         self._heartbeat_seconds = heartbeat_seconds
+        # 中文：删除任务与摄取共享租约和 fencing，但由独立用例执行。
+        # English: Deletion shares lease/fencing infrastructure but executes a separate use case.
+        self._process_deletion = process_deletion
 
     def run_once(self) -> bool:
         """中文：该函数或方法负责“执行一轮处理”相关处理。
@@ -135,6 +142,18 @@ class IngestionWorker:
                     expected_generation=fence.document_generation,
                 )
         try:
+            if job.job_type is JobType.DELETION:
+                if self._process_deletion is None:
+                    raise RuntimeError("deletion processor is not configured")
+                deletion_guard = JobLeaseGuard(
+                    self._sessions,
+                    fence,
+                    self._lease_seconds,
+                    self._heartbeat_seconds,
+                )
+                with deletion_guard:
+                    self._process_deletion(job, fence)
+                return True
             # 中文：关键变量 `lease_guard` 在 OCR、Embedding 和索引构建期间持续续租。
             # English: Key variable `lease_guard` renews through OCR, embedding, and indexing.
             lease_guard = JobLeaseGuard(
@@ -171,6 +190,33 @@ class IngestionWorker:
                 # 中文：Chunk 和质量指标在一个短事务内通过相同 fencing token 提交。
                 # English: Chunks and quality metrics commit in one short fenced transaction.
                 persistence_time = datetime.now(UTC)
+                # 中文：降级事实来自最终 Chunk 审计元数据，按文档去重后进入独立报告。
+                # English: Degradation facts come from final chunk audit metadata and are
+                # deduplicated at document scope.
+                degradation_codes = _quality_degradation_codes(prepared.chunks)
+                quality_report = IngestionQualityReport(
+                    id=stable_id("qlt", (version.id, "chunk-quality-v1")),
+                    tenant_id=version.tenant_id,
+                    document_id=version.document_id,
+                    document_version_id=version.id,
+                    decision=(
+                        QualityDecision.PASS_WITH_WARNINGS
+                        if prepared.quality_assessment.warnings or degradation_codes
+                        else QualityDecision.PASS
+                    ),
+                    validator_version="chunk-quality-v1",
+                    created_at=persistence_time,
+                    metrics=dict(prepared.quality_assessment.metrics),
+                    findings=tuple(
+                        QualityFinding(
+                            code=warning,
+                            severity="warning",
+                            message=f"Ingestion quality warning: {warning}.",
+                        )
+                        for warning in prepared.quality_assessment.warnings
+                    ),
+                    degradation_codes=degradation_codes,
+                )
                 with transactional_session(self._sessions) as session:
                     repositories = SQLAlchemyRepositories(session)
                     repositories.replace_version_chunks_fenced(
@@ -184,6 +230,11 @@ class IngestionWorker:
                         version.id,
                         dict(prepared.quality_assessment.metrics),
                         prepared.quality_assessment.warnings,
+                        persistence_time,
+                    )
+                    repositories.add_quality_report_fenced(
+                        fence,
+                        quality_report,
                         persistence_time,
                     )
                 lease_guard.checkpoint()
@@ -205,6 +256,20 @@ class IngestionWorker:
                         fence,
                         datetime.now(UTC),
                         "lifecycle_cancelled",
+                    )
+            except (LeaseLostError, LifecycleFenceError, JobCancelledError):
+                pass
+            return True
+        except DocumentGenerationStaleError:
+            # 中文：文档代次失效必须形成 STALE 终态；CAS 仍阻止旧租约覆盖新 Worker。
+            # English: Generation invalidation must become STALE; CAS still prevents an old
+            # lease from overwriting a newly claimed worker.
+            try:
+                with transactional_session(self._sessions) as session:
+                    SQLAlchemyRepositories(session).mark_job_stale(
+                        fence,
+                        datetime.now(UTC),
+                        "The document generation changed before publication.",
                     )
             except (LeaseLostError, LifecycleFenceError, JobCancelledError):
                 pass
@@ -259,7 +324,7 @@ class IngestionWorker:
                             error_code,
                             error_message,
                         )
-                    if not has_active_version:
+                    if not has_active_version and job.job_type is not JobType.DELETION:
                         repositories.set_document_status(
                             job.tenant_id,
                             job.document_id,
@@ -271,3 +336,30 @@ class IngestionWorker:
                 # English: Losing the lease during error handling also forbids stale writes.
                 return True
         return True
+
+
+def _quality_degradation_codes(chunks: tuple[Chunk, ...]) -> tuple[str, ...]:
+    """中文：从 Chunk 元数据中提取稳定降级码，不记录 Provider 异常正文。
+
+    English: Extract stable degradation codes from chunk metadata without provider exception
+    text.
+    """
+
+    # 中文：关键变量 `codes` 保持首次出现顺序，保证报告和测试可复现。
+    # English: Key variable `codes` preserves first-seen order for reproducible reports/tests.
+    codes: list[str] = []
+    for candidate in chunks:
+        # 中文：Chunk 元数据仅包含稳定审计字段，不读取原始 Provider 异常消息。
+        # English: Chunk metadata contributes stable audit fields, never raw provider errors.
+        metadata = getattr(candidate, "metadata", {})
+        if not isinstance(metadata, dict):
+            continue
+        for key in ("embedding_preparation_failure", "fallback_reason"):
+            value = metadata.get(key)
+            if not isinstance(value, str):
+                continue
+            for code in value.split(","):
+                normalized = code.strip()
+                if normalized and normalized not in codes:
+                    codes.append(normalized)
+    return tuple(codes)

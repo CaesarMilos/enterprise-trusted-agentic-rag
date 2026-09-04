@@ -14,7 +14,6 @@ from enterprise_rag.api.dependencies import build_container
 from enterprise_rag.core.ids import content_sha256
 from enterprise_rag.domain.models import UserContext
 from enterprise_rag.domain.requests import ChatCommand
-from enterprise_rag.domain.results import AnswerResult
 from enterprise_rag.evaluation.dataset import load_dataset
 from enterprise_rag.evaluation.runner import EvaluationPrediction, EvaluationRunner
 
@@ -58,16 +57,21 @@ def main() -> None:
         """
 
         result = container.chat.chat(ChatCommand(user=user, query=query))
-        # 中文：本步骤涉及最终、引用、视图、选中的、检索，具体约束见下方英文说明。
-        # English: Final verified citations are a conservative view of selected retrieval
-        #   evidence.
-        if isinstance(result, AnswerResult):
-            source_ids = tuple(dict.fromkeys(citation.source_id for citation in result.citations))
-            chunk_ids = tuple(citation.chunk_id for citation in result.citations)
-        else:
-            source_ids = ()
-            chunk_ids = ()
-        return EvaluationPrediction(result, source_ids, chunk_ids)
+        # 中文：即使最终拒答，也从内部 Trace 读取真实 Router 和排名输出。
+        # English: Real router and ranking outputs remain available even when the final result
+        # is a refusal.
+        trace = result.retrieval_trace
+        if trace is None:
+            return EvaluationPrediction(result, (), ())
+        return EvaluationPrediction(
+            result=result,
+            routed_source_ids=trace.routed_source_ids,
+            retrieved_chunk_ids=tuple(item.chunk_id for item in trace.reranked),
+            dense_chunk_ids=tuple(item.chunk_id for item in trace.dense),
+            bm25_chunk_ids=tuple(item.chunk_id for item in trace.bm25),
+            fused_chunk_ids=tuple(item.chunk_id for item in trace.fused),
+            reranked_chunk_ids=tuple(item.chunk_id for item in trace.reranked),
+        )
 
     # 中文：变量 `config_fingerprint` 用于保存“配置指纹”相关数据；
     # 其精确定义与约束见下方英文说明。

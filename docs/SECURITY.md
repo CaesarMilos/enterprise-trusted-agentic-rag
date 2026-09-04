@@ -1,55 +1,50 @@
-# V4 安全设计
+# 安全边界与威胁模型 / Security boundaries and threat model
 
 ## 信任边界
 
-外部客户端只连接网关。网关删除客户端提供的用户、租户、角色、Source、用户组和代理密钥头，再转发到内部 API。API 只根据经过密码学验证的 JWT，或经过共享密钥验证的可信代理身份构造 `UserContext`。
+- HTTP 身份：只信任经过配置的 JWT 或受控反向代理；Demo auth 仅允许 development。
+- tenant/source/document/version：所有 repository 查询显式携带 tenant，Router 只能在预授权 Source 内选择。
+- 文档正文：始终是不可信数据，不能覆盖 System Prompt、ACL、工具权限或引用规则。
+- Provider：LLM/Embedding/OCR/Reranker 是外部或本地不可信依赖，必须有 timeout、fingerprint、数据出域说明和降级策略。
+- 文件系统：上传和索引键为服务端生成的不透明 ID，所有目标必须位于 tenant 隔离根目录。
 
-## 认证模式
+## 威胁—控制矩阵
 
-三种模式互斥：
+| 威胁 | 当前控制 | 剩余验证 |
+|---|---|---|
+| 跨租户/越权检索 | tenant predicates、ACL 前置过滤、Citation 返回前复核 | 全 API 属性测试与外部渗透测试 |
+| 删除后旧缓存/快照返回 | revocation epoch、PENDING_DELETE、snapshot loader 和 final verifier | 多进程并发压力测试 |
+| 文档 Prompt Injection | 不可信文档边界、证据限定 Prompt、无文档工具权限 | 对抗文档黄金集 |
+| 路径穿越 | opaque storage key、safe segment、root-relative 校验 | parser/压缩格式扩展前重新评审 |
+| 上传炸弹/超大请求 | ASGI request-body limit、文件级 limit、类型/签名校验 | PDF 对象/页数/解压比限额 |
+| Provider 永久阻塞 | 剩余 Deadline、HTTP timeout、共享有界执行器 | 需要绝对 kill 时使用进程隔离 |
+| Secret 泄漏 | env/secret store、Trace key 过滤、不记录 Prompt/正文 | 集中日志 DLP 和 Secret rotation |
+| Trace 成为敏感仓库 | 默认 summary、候选只存 ID、值长度上限 | 自动 retention 与分级访问 |
+| 依赖漏洞 | 版本上限和可重现 lock | SBOM、签名、持续 CVE 扫描 |
+| 恶意/漏洞 PDF | 文件验证、隔离 Loader 接口 | sandbox parser、CPU/内存/页数预算 |
 
-- `demo`：仅开发配置；生产环境选择它会拒绝启动。
-- `jwt`：生产默认；验证 HS256、签名、`exp`、`nbf`、`iss`、`aud`、`sub` 和 `tenant_id`。
-- `trusted_proxy`：只允许位于受控代理之后；请求必须携带进程环境中的共享密钥。
+## 权限撤销优先级
 
-JWT 密钥读取自 `ENTERPRISE_RAG_JWT_SECRET`。代理密钥读取自 `ENTERPRISE_RAG_PROXY_SECRET`。密钥不得进入 YAML、镜像、Trace、日志或错误响应。
+普通 reprocess/索引切换允许已开始请求完成固定快照；Source 停用、权限撤销和文档删除立即优先。CitationVerifier 在返回前重新读取当前 Source、Document 和 DocumentVersion；失败时结构化拒答，不能返回“几分钟前还合法”的正文。
 
-## 授权与租户隔离
+## 日志和 Trace
 
-所有文档、版本、Chunk、任务、索引和 Trace 都带 `tenant_id`。Repository 查询显式包含租户条件；在线检索还必须把请求 Source 范围与用户允许范围求交集。Source Router 只在授权候选内工作，不能扩大 ACL。
+禁止记录 API key、Authorization、密码、完整 Prompt、完整 Chunk 正文和上传文件。错误响应只包含稳定 code/category、安全 message 和受限 context；未知异常不得把堆栈或 Provider 响应返回客户端。
 
-管理员只在当前租户内拥有重建索引、修改画像和查看租户 Trace 的权限。`requested_source_ids` 只是进一步收窄，不是授权声明。
+## 数据外发
 
-## 文件和解析安全
+部署者必须为每个 Provider 记录：数据是否出域、区域、保留策略、模型训练策略、传输加密、超时/重试、成本和替换测试。Provider 抽象本身不等于合规；如果企业禁止正文出域，应选择本地模型或在发送前实施获批脱敏。
 
-- ASGI 中间件在 multipart 解析前限制总请求体；端点再限制单文件字节数。
-- 后缀、MIME 和文件签名联合校验，原文件路径由服务端稳定 ID 生成。
-- 租户目录隔离、路径穿越防护、临时文件清理、原子移动和 SHA-256 校验。
-- PDF/OCR/文本异常转换为稳定错误，不把原文或内部路径暴露给客户端。
+## 正式版门禁
 
-## 生命周期与索引安全
+- 威胁—控制—测试矩阵逐项关联自动化或演练证据；
+- 依赖 SBOM、漏洞扫描和许可证清单；
+- parser sandbox/资源预算；
+- 审计日志完整性与防篡改导出；
+- Trace retention 与管理员/开发者分级；
+- 删除证明和备份恢复不复活 revoked 内容；
+- 多租户越权、Prompt Injection 和恶意 PDF 对抗测试。
 
-删除请求递增 `lifecycle_generation`，使旧任务的快照立即失效。Worker 的租约、attempt token、取消状态和 generation 共同组成 fencing。活动索引发布使用 CAS；请求固定一个索引快照，避免问答过程中读到半发布状态。
-
-## 模型与提示词安全
-
-- 模型只收到调用者授权的 Evidence Pack。
-- Query Rewrite 不得改变原始权限范围，最多执行配置次数。
-- 回答必须引用当前快照的真实 Child；引用校验失败则拒答。
-- LLM 边界复核只接收相邻局部单元，只在模糊分数带触发并受单文档调用上限约束。
-- Trace 记录指纹、计数和原因，不记录 API Key。
-
-## 容器基线
-
-运行用户固定为 UID/GID `10001`；文件系统只读，仅数据卷、模型缓存和 `/tmp` 可写；容器删除 Linux capabilities 并启用 `no-new-privileges`。API 在生产 Compose 中不映射主机端口，只有 Nginx 网关公开。
-
-## 发布前安全测试
-
-- 伪造 `X-Roles: admin` 和 `X-Tenant-Id` 无效。
-- JWT 错误签名、错误 issuer/audience、过期和未生效令牌被拒绝。
-- 跨租户 Source、文档、索引和 Trace 不可见。
-- 删除与 Worker 并发时旧任务无法写回或发布。
-- 上传超限、路径穿越、错误签名文件被拒绝。
-- 生产环境缺少认证密钥时进程在监听端口前失败。
-
-本工程提供应用级安全边界，但生产部署仍需 TLS、密钥轮换、镜像扫描、依赖漏洞扫描、数据库备份、日志留存和基础设施访问控制。
+English summary: V5 treats identity, document content, providers, traces, and filesystem paths as
+separate trust boundaries. Current controls are meaningful but do not replace deployment-specific
+penetration, compliance, SBOM, and recovery evidence.

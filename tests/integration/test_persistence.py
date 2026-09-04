@@ -26,6 +26,7 @@ from enterprise_rag.domain.models import (
     IndexVersion,
     IngestionJob,
     Source,
+    TraceRecord,
 )
 from enterprise_rag.infrastructure.persistence.database import (
     create_database_engine,
@@ -163,6 +164,35 @@ def test_source_content_profile_round_trips_through_sqlite(tmp_path: Path) -> No
         assert loaded.content_profile is ContentProfile.MANUAL
 
 
+def test_trace_snapshot_identity_round_trips_through_sqlite(tmp_path: Path) -> None:
+    """中文：查询快照标识必须写入正式列并能够完整读回。
+
+    English: Query snapshot identity must persist in its dedicated column and round-trip.
+    """
+
+    sessions = _sessions(tmp_path)
+    _seed_ready_document(sessions, "tenant-a", "source-a", "document-a")
+    with transactional_session(sessions) as session:
+        SQLAlchemyRepositories(session).add_trace(
+            TraceRecord(
+                id="trace-a",
+                tenant_id="tenant-a",
+                user_id="user-a",
+                operation="chat",
+                status="started",
+                index_version_id="index-a",
+                snapshot_id="snapshot-a",
+            )
+        )
+
+    with transactional_session(sessions) as session:
+        loaded = SQLAlchemyRepositories(session).get_trace("tenant-a", "trace-a")
+
+    assert loaded is not None
+    assert loaded.index_version_id == "index-a"
+    assert loaded.snapshot_id == "snapshot-a"
+
+
 def test_pending_delete_immediately_disappears_from_active_chunks(tmp_path: Path) -> None:
     """中文：该测试用于验证“待处理的删除立即`disappears`从活动文本块”相关行为。
 
@@ -185,10 +215,13 @@ def test_pending_delete_immediately_disappears_from_active_chunks(tmp_path: Path
         repositories = SQLAlchemyRepositories(session)
         assert repositories.list_active_chunks("tenant-a") == ()
         assert repositories.get_chunks("tenant-a", ("chunk-document-a",)) == ()
-        assert repositories.get_retrievable_chunks(
-            "tenant-a",
-            ("chunk-document-a",),
-        ) == ()
+        assert (
+            repositories.get_retrievable_chunks(
+                "tenant-a",
+                ("chunk-document-a",),
+            )
+            == ()
+        )
 
 
 def test_sqlite_job_claim_cannot_return_the_same_job_twice(tmp_path: Path) -> None:

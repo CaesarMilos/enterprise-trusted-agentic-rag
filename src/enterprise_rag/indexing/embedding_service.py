@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 from enterprise_rag.core.enums import ErrorCategory
 from enterprise_rag.core.exceptions import ModelProviderError, error_detail
 from enterprise_rag.domain.protocols.models import EmbeddingProvider
+from enterprise_rag.indexing.provider_invocation import embed_with_timeout
 
 
 class EmbeddingService:
@@ -55,7 +56,12 @@ class EmbeddingService:
 
         return self._provider.fingerprint
 
-    def embed(self, texts: Sequence[str]) -> NDArray[np.float32]:
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> NDArray[np.float32]:
         """中文：该函数或方法负责“向量化”相关处理。
 
         English: Return a two-dimensional float32 matrix of normalized embeddings.
@@ -75,7 +81,7 @@ class EmbeddingService:
             # English: Current batch retains exact caller ordering.
             batch = texts[start : start + self._batch_size]
             try:
-                batch_vectors = self._provider.embed(batch)
+                batch_vectors = embed_with_timeout(self._provider, batch, timeout_seconds)
             except Exception as exc:
                 raise ModelProviderError(
                     error_detail(
@@ -144,10 +150,18 @@ class EmbeddingService:
             )
         return np.asarray(matrix / norms, dtype=np.float32)
 
-    def embed_query(self, query: str) -> NDArray[np.float32]:
+    def embed_query(
+        self,
+        query: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> NDArray[np.float32]:
         """中文：该函数或方法负责“向量化查询”相关处理。
 
         English: Return one normalized query vector.
         """
 
-        return np.asarray(self.embed((query,))[0], dtype=np.float32)
+        return np.asarray(
+            self.embed((query,), timeout_seconds=timeout_seconds)[0],
+            dtype=np.float32,
+        )

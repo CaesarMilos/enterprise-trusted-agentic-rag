@@ -64,6 +64,9 @@ class RetryIngestionCommand:
     # 中文：变量 `document_id` 用于保存“文档标识符”相关数据；其精确定义与约束见下方英文说明。
     # English: Failed logical document.
     document_id: str
+    # 中文：可选幂等键使网络重试返回同一后台任务。
+    # English: Optional idempotency key makes network retries return the same background job.
+    idempotency_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +82,9 @@ class ReprocessDocumentCommand:
     # 中文：待重新处理的逻辑文档标识符。
     # English: Logical document identifier to reprocess.
     document_id: str
+    # 中文：可选幂等键阻止重复点击创建多个候选版本。
+    # English: Optional idempotency key prevents repeated clicks creating duplicate candidates.
+    idempotency_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

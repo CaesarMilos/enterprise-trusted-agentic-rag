@@ -74,6 +74,9 @@ class _ChunkDraft:
     section_number: str | None
     source_start_offset: int
     source_end_offset: int
+    # 中文：关键变量 `hard_boundary_key` 在后处理阶段继续阻止跨法条合并与重叠。
+    # English: Key variable `hard_boundary_key` keeps post-processing inside one hard unit.
+    hard_boundary_key: str | None = None
     boundary_score: float | None = None
     boundary_threshold: float | None = None
     boundary_features: dict[str, float] | None = None
@@ -88,6 +91,8 @@ class _ChunkDraft:
         English: Return the stable structural grouping key used to create parent chunks.
         """
 
+        if self.hard_boundary_key:
+            return (self.hard_boundary_key,)
         if self.heading_path:
             return self.heading_path
         if self.section_number:
@@ -158,7 +163,7 @@ class DynamicSemanticChunker:
         )
         # 中文：向量在循环前按文档批量生成并缓存，候选边界不再逐次调用提供方。
         # English: Vectors are batch-generated and cached before candidate-boundary iteration.
-        self._boundary_analyzer.prepare(bounded_units)
+        preparation = self._boundary_analyzer.prepare(bounded_units)
         leaf_drafts: list[_ChunkDraft] = []
         buffer: list[StructuredUnit] = []
         buffer_tokens = 0
@@ -170,6 +175,28 @@ class DynamicSemanticChunker:
         # and failures cannot bypass the cap.
         review_budget = BoundaryReviewBudget(self._max_llm_boundaries)
         for unit in bounded_units:
+            # 中文：关键变量 `forced_hard_split` 在法条键变化时先提交旧缓冲区，
+            # 因此语义阈值和最小长度都不能跨越法规硬边界。
+            # English: Key variable `forced_hard_split` commits the old buffer when article
+            # keys change, so semantic thresholds and minimum sizes cannot cross hard units.
+            forced_hard_split = bool(
+                buffer
+                and buffer[-1].hard_boundary_key != unit.hard_boundary_key
+                and (
+                    buffer[-1].hard_boundary_key is not None
+                    or unit.hard_boundary_key is not None
+                )
+            )
+            if forced_hard_split:
+                leaf_drafts.append(
+                    self._draft(
+                        buffer,
+                        BoundaryDecision(True, "hard_boundary_key_change", 1.0),
+                    )
+                )
+                buffer = []
+                buffer_tokens = 0
+                pending_fallbacks = []
             decision = self._boundary_analyzer.decide(
                 buffer,
                 buffer_tokens,
@@ -213,9 +240,7 @@ class DynamicSemanticChunker:
         leaf_drafts = self._merge_short_drafts(leaf_drafts)
         leaf_drafts = self._apply_adaptive_overlap(leaf_drafts)
 
-        parent_drafts = (
-            self._build_parent_drafts(leaf_drafts) if self._create_parent_chunks else []
-        )
+        parent_drafts = self._build_parent_drafts(leaf_drafts) if self._create_parent_chunks else []
         # 中文：叶子块保持源文顺序，父块追加在后，避免父块破坏相邻引用导航。
         # English: Leaves retain source order and parents append afterward so adjacency remains
         # citation-friendly.
@@ -257,9 +282,7 @@ class DynamicSemanticChunker:
                     page_start=draft.page_start,
                     page_end=draft.page_end,
                     heading_path=draft.heading_path,
-                    previous_chunk_id=(
-                        chunk_ids[ordinal - 1] if is_leaf and ordinal > 0 else None
-                    ),
+                    previous_chunk_id=(chunk_ids[ordinal - 1] if is_leaf and ordinal > 0 else None),
                     next_chunk_id=(
                         chunk_ids[ordinal + 1]
                         if is_leaf and ordinal + 1 < len(leaf_drafts)
@@ -277,17 +300,18 @@ class DynamicSemanticChunker:
                     source_end_offset=draft.source_end_offset,
                     boundary_method=draft.boundary_method,
                     boundary_confidence=draft.boundary_confidence,
+                    hard_boundary_key=draft.hard_boundary_key,
                     metadata={
                         "content_profile": context.content_profile,
                         "strategy_id": context.strategy_id,
                         "unit_types": list(draft.unit_types),
                         "child_leaf_indexes": list(draft.child_leaf_indexes),
-                        "child_chunk_ids": [
-                            chunk_ids[index] for index in draft.child_leaf_indexes
-                        ],
+                        "child_chunk_ids": [chunk_ids[index] for index in draft.child_leaf_indexes],
                         "llm_attempted": draft.llm_attempted,
                         "llm_calls_used": draft.llm_calls_used,
                         "fallback_reason": draft.fallback_reason,
+                        "embedding_preparation_mode": preparation.mode,
+                        "embedding_preparation_failure": preparation.failure_code,
                         "boundary_similarity": draft.similarity,
                         "boundary_score": draft.boundary_score,
                         "boundary_threshold": draft.boundary_threshold,
@@ -296,6 +320,10 @@ class DynamicSemanticChunker:
                     },
                 )
             )
+        # 中文：文档产物已构建完成，立即释放批量向量；下篇文档重新独立准备。
+        # English: Release batch vectors after artifact construction; the next document prepares
+        # independently.
+        self._boundary_analyzer.release_document_cache()
         return tuple(chunks)
 
     def _merge_short_drafts(self, drafts: list[_ChunkDraft]) -> list[_ChunkDraft]:
@@ -339,6 +367,7 @@ class DynamicSemanticChunker:
         right_roles = set(right.unit_types) & protected_roles
         return (
             left.boundary_method not in hard_methods
+            and left.hard_boundary_key == right.hard_boundary_key
             and left.parent_key == right.parent_key
             and (not left_roles and not right_roles or left_roles == right_roles)
             and left.token_count + right.token_count <= self._max_tokens
@@ -372,6 +401,7 @@ class DynamicSemanticChunker:
             section_number=right.section_number or left.section_number,
             source_start_offset=min(left.source_start_offset, right.source_start_offset),
             source_end_offset=max(left.source_end_offset, right.source_end_offset),
+            hard_boundary_key=left.hard_boundary_key,
             boundary_score=right.boundary_score,
             boundary_threshold=right.boundary_threshold,
             boundary_features=right.boundary_features,
@@ -391,6 +421,7 @@ class DynamicSemanticChunker:
             overlap = ""
             if (
                 previous.parent_key == current.parent_key
+                and previous.hard_boundary_key == current.hard_boundary_key
                 and previous.section_number == current.section_number
                 and previous.boundary_method
                 not in {"structural_boundary", "heading_change", "max_tokens"}
@@ -448,6 +479,7 @@ class DynamicSemanticChunker:
                     retrieval_text=retrieval_text,
                     source_start_offset=unit.source_start_offset + local_start,
                     source_end_offset=unit.source_start_offset + local_end,
+                    hard_boundary_key=unit.hard_boundary_key,
                 )
             )
         return tuple(windows)
@@ -488,6 +520,15 @@ class DynamicSemanticChunker:
                 (unit.section_number for unit in units if unit.section_number),
                 None,
             )
+        # 中文：变量 `hard_boundary_keys` 必须至多包含一个键；出现多个键说明上游
+        # 强制边界保护失效，禁止生成不可审计的跨条 Chunk。
+        # English: Variable `hard_boundary_keys` must contain at most one value; multiple
+        # values mean upstream hard-boundary protection failed and chunking must stop.
+        hard_boundary_keys = {
+            unit.hard_boundary_key for unit in units if unit.hard_boundary_key is not None
+        }
+        if len(hard_boundary_keys) > 1:
+            raise ValueError("a chunk draft cannot cross hard boundary keys")
         return _ChunkDraft(
             text=text,
             retrieval_text=retrieval_text,
@@ -506,6 +547,7 @@ class DynamicSemanticChunker:
             section_number=section_number,
             source_start_offset=min(unit.source_start_offset for unit in units),
             source_end_offset=max(unit.source_end_offset for unit in units),
+            hard_boundary_key=(next(iter(hard_boundary_keys)) if hard_boundary_keys else None),
             boundary_score=decision.score,
             boundary_threshold=decision.threshold,
             boundary_features=decision.features,
@@ -559,6 +601,7 @@ class DynamicSemanticChunker:
                     section_number=drafts[0].section_number,
                     source_start_offset=min(draft.source_start_offset for draft in drafts),
                     source_end_offset=max(draft.source_end_offset for draft in drafts),
+                    hard_boundary_key=drafts[0].hard_boundary_key,
                     chunk_level="parent",
                     child_leaf_indexes=indexes,
                 )

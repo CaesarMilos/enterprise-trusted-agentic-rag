@@ -8,8 +8,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from enterprise_rag.core.enums import RefusalReason
+from enterprise_rag.core.enums import AnswerStatus, RefusalReason
+from enterprise_rag.domain.answers import VerifiedAnswer
 from enterprise_rag.domain.models import Citation
+from enterprise_rag.retrieval.models import RetrievalTrace
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +34,35 @@ class IngestionAccepted:
     # 中文：变量 `status` 用于保存“状态”相关数据；其精确定义与约束见下方英文说明。
     # English: Public initial document state.
     status: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionAccepted:
+    """中文：确认文档已立即撤销可检索性，后台删除任务已持久化。
+
+    English: Confirm immediate retrieval revocation and durable asynchronous deletion.
+    """
+
+    deletion_job_id: str
+    document_id: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class JobDetail:
+    """中文：以权限安全形式展示持久任务状态和稳定错误码。
+
+    English: Expose durable job state and stable error codes without sensitive details.
+    """
+
+    job_id: str
+    job_type: str
+    document_id: str
+    document_version_id: str
+    status: str
+    attempt_count: int
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +173,16 @@ class AnswerResult:
     # 其精确定义与约束见下方英文说明。
     # English: Number of retrieval attempts, including the initial attempt.
     retrieval_rounds: int
+    # 中文：内部评测消费真实检索阶段；HTTP Schema 不直接暴露该详细数据。
+    # English: Internal evaluation consumes real stages; the public HTTP schema omits them.
+    retrieval_trace: RetrievalTrace | None = None
+    # 中文：回答状态区分完整回答与安全的部分回答；默认值保持 V4 调用兼容。
+    # English: Answer status distinguishes complete and safe partial answers; the default
+    # preserves V4 constructor compatibility.
+    status: AnswerStatus = AnswerStatus.ANSWERED
+    # 中文：V5 结构化协议绑定 AnswerItem、Claim、Evidence 和缺失信息。
+    # English: The V5 protocol binds answer items, claims, evidence, and missing information.
+    verified_protocol: VerifiedAnswer | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +205,9 @@ class RefusalResult:
     # 其精确定义与约束见下方英文说明。
     # English: Immutable index snapshot used when retrieval occurred.
     index_version_id: str | None = None
+    # 中文：拒答不得擦除已经执行的检索排名。
+    # English: A refusal must not erase retrieval rankings that already ran.
+    retrieval_trace: RetrievalTrace | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +223,12 @@ class TraceView:
     # 中文：变量 `status` 用于保存“状态”相关数据；其精确定义与约束见下方英文说明。
     # English: Final workflow status.
     status: str
+    # 中文：查询绑定的不可变索引版本；非知识流程可以为空。
+    # English: Immutable index version pinned to the query; absent for non-knowledge flows.
+    index_version_id: str | None
+    # 中文：查询绑定的文档版本快照标识。
+    # English: Document-version snapshot identity pinned to the query.
+    snapshot_id: str | None
     # 中文：变量 `steps` 用于保存“`steps`”相关数据；其精确定义与约束见下方英文说明。
     # English: Ordered safe step summaries.
     steps: tuple[dict[str, Any], ...]

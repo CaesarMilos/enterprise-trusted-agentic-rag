@@ -33,6 +33,8 @@ def get_trace(
     return TraceSchema(
         trace_id=result.trace_id,
         status=result.status,
+        index_version_id=result.index_version_id,
+        snapshot_id=result.snapshot_id,
         steps=list(result.steps),
         metrics=result.metrics,
     )

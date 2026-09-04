@@ -14,7 +14,12 @@ from typing import Any, Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from enterprise_rag.core.enums import AuthenticationMode, ErrorCategory
+from enterprise_rag.core.enums import (
+    AuthenticationMode,
+    ContractEnforcementMode,
+    ErrorCategory,
+    TraceLevel,
+)
 from enterprise_rag.core.exceptions import ValidationError, error_detail
 
 # 中文：变量 `_ENV_PREFIX` 用于保存“`env``prefix`”相关数据；其精确定义与约束见下方英文说明。
@@ -128,6 +133,16 @@ class IngestionSettings(FrozenSettingsModel):
     # 中文：变量 `parent_chunks_enabled` 控制是否建立叶子块到父上下文块的层级。
     # English: `parent_chunks_enabled` controls leaf-to-parent context hierarchy creation.
     parent_chunks_enabled: bool = True
+    # 中文：Dense 输入预算与紧凑标题限制防止长公共前缀占满模型截断窗口。
+    # English: Dense-input and compact-heading limits prevent common prefixes consuming the
+    # model truncation window.
+    embedding_text_max_tokens: int = Field(default=384, ge=32, le=2048)
+    index_heading_max_depth: int = Field(default=2, ge=0, le=8)
+    index_heading_max_characters: int = Field(default=96, ge=1, le=512)
+    # 中文：向量碰撞门槛阻止不同正文以完全相同表示发布。
+    # English: Vector-collision thresholds block identical representations across distinct bodies.
+    max_exact_duplicate_vector_group: int = Field(default=3, ge=1)
+    max_harmful_duplicate_vector_ratio: float = Field(default=0.01, ge=0.0, le=1.0)
     # 中文：变量 `job_lease_seconds` 用于保存“任务`lease``seconds`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Number of lease seconds before another worker may recover a running job.
@@ -350,6 +365,119 @@ class EvaluationSettings(FrozenSettingsModel):
     output_dir: Path = Path("reports")
 
 
+class ContentContractSettings(FrozenSettingsModel):
+    """中文：配置通用内容画像选择、冲突校验和样本边界。
+
+    English: Configure generic profile selection, mismatch checks, and sample bounds.
+    """
+
+    schema_version: str = "source-contract-v1"
+    automatic_profile_min_confidence: float = Field(default=0.70, ge=0.0, le=1.0)
+    profile_mismatch_confidence: float = Field(default=0.80, ge=0.0, le=1.0)
+    default_enforcement_mode: ContractEnforcementMode = ContractEnforcementMode.WARN
+    profiler_min_sample_characters: int = Field(default=2_000, ge=1)
+    profiler_max_sample_characters: int = Field(default=30_000, ge=1)
+
+    @model_validator(mode="after")
+    def validate_profile_thresholds(self) -> Self:
+        """中文：确保自动选择阈值不高于高置信度不匹配阈值。
+
+        English: Ensure automatic selection does not exceed mismatch-confidence threshold.
+        """
+
+        if self.automatic_profile_min_confidence > self.profile_mismatch_confidence:
+            raise ValueError("automatic profile threshold cannot exceed mismatch threshold")
+        if self.profiler_min_sample_characters > self.profiler_max_sample_characters:
+            raise ValueError("profiler sample bounds must satisfy min <= max")
+        return self
+
+
+class SnapshotSettings(FrozenSettingsModel):
+    """中文：配置查询快照租约和物理清理宽限期。
+
+    English: Configure query snapshot leases and physical-cleanup grace periods.
+    """
+
+    ttl_seconds: int = Field(default=120, ge=1)
+    maximum_ttl_seconds: int = Field(default=300, ge=1)
+    cleanup_grace_seconds: int = Field(default=30, ge=0)
+
+    @model_validator(mode="after")
+    def validate_snapshot_bounds(self) -> Self:
+        """中文：确保默认快照租约不超过配置的硬上限。
+
+        English: Ensure the default snapshot lease fits within the configured hard maximum.
+        """
+
+        if self.ttl_seconds > self.maximum_ttl_seconds:
+            raise ValueError("snapshot ttl cannot exceed maximum ttl")
+        return self
+
+
+class QuestionPlanSettings(FrozenSettingsModel):
+    """中文：限制问题拆解规模，防止异常模型输出放大检索成本。
+
+    English: Bound question decomposition to prevent malformed plans amplifying retrieval cost.
+    """
+
+    schema_version: str = "question-plan-v1"
+    max_total_needs: int = Field(default=16, ge=1, le=64)
+    max_required_needs: int = Field(default=12, ge=1, le=64)
+    max_anchors: int = Field(default=32, ge=0, le=128)
+    max_dependency_depth: int = Field(default=4, ge=0, le=16)
+    # 中文：改写查询与当前查询的最大 Token Jaccard 距离。
+    # English: Maximum token-Jaccard distance between current and rewritten queries.
+    maximum_rewrite_drift: float = Field(default=0.75, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_need_limits(self) -> Self:
+        """中文：确保 required Need 上限不超过总 Need 上限。
+
+        English: Ensure the required-need limit does not exceed the total-need limit.
+        """
+
+        if self.max_required_needs > self.max_total_needs:
+            raise ValueError("required need limit cannot exceed total need limit")
+        return self
+
+
+class ProviderRuntimeSettings(FrozenSettingsModel):
+    """中文：配置不可中断 Provider 的有界执行和熔断策略。
+
+    English: Configure bounded execution and circuit breaking for non-interruptible providers.
+    """
+
+    allow_lexical_only_publication: bool = True
+    executor_workers: int = Field(default=4, ge=1, le=128)
+    executor_queue_capacity: int = Field(default=8, ge=0, le=1024)
+    circuit_breaker_failure_threshold: int = Field(default=5, ge=1)
+    circuit_breaker_reset_seconds: int = Field(default=30, ge=1)
+
+
+class TraceSettings(FrozenSettingsModel):
+    """中文：配置追踪详细级别、保留期限和候选记录上限。
+
+    English: Configure trace detail, retention, and ranked-candidate recording limits.
+    """
+
+    default_level: TraceLevel = TraceLevel.SUMMARY
+    summary_retention_days: int = Field(default=30, ge=1)
+    diagnostic_retention_days: int = Field(default=14, ge=1)
+    ranked_candidate_limit: int = Field(default=100, ge=1, le=10_000)
+
+
+class CompatibilitySettings(FrozenSettingsModel):
+    """中文：控制 V4 到 V5 扩展迁移期间的双读写兼容行为。
+
+    English: Control dual-read/write compatibility during the V4-to-V5 expand migration.
+    """
+
+    api_v1_enabled: bool = True
+    legacy_profile_read_enabled: bool = True
+    legacy_status_projection_enabled: bool = True
+    write_legacy_status_during_transition: bool = True
+
+
 class SecuritySettings(FrozenSettingsModel):
     """中文：该类用于表示或实现“安全设置（SecuritySettings）”的职责。
 
@@ -399,7 +527,7 @@ class Settings(FrozenSettingsModel):
 
     # 中文：变量 `config_version` 用于保存“配置版本”相关数据；其精确定义与约束见下方英文说明。
     # English: Schema version used to reject incompatible configuration files.
-    config_version: str = "4.0"
+    config_version: str = "5.0"
     # 中文：变量 `application` 用于保存“应用”相关数据；其精确定义与约束见下方英文说明。
     # English: General application configuration.
     application: ApplicationSettings = ApplicationSettings()
@@ -427,6 +555,24 @@ class Settings(FrozenSettingsModel):
     # 中文：变量 `evaluation` 用于保存“评估”相关数据；其精确定义与约束见下方英文说明。
     # English: Reproducible evaluation configuration.
     evaluation: EvaluationSettings = EvaluationSettings()
+    # 中文：变量 `content_contract` 配置资料源结构契约和自动画像的安全边界。
+    # English: `content_contract` configures source contracts and safe auto-profile limits.
+    content_contract: ContentContractSettings = ContentContractSettings()
+    # 中文：变量 `snapshot` 配置问答固定快照及清理宽限期。
+    # English: `snapshot` configures fixed query snapshots and cleanup grace.
+    snapshot: SnapshotSettings = SnapshotSettings()
+    # 中文：变量 `question_plan` 限制问题拆解的规模和依赖深度。
+    # English: `question_plan` bounds decomposition size and dependency depth.
+    question_plan: QuestionPlanSettings = QuestionPlanSettings()
+    # 中文：变量 `providers` 配置有界 Provider 线程和降级发布。
+    # English: `providers` configures bounded provider execution and degraded publication.
+    providers: ProviderRuntimeSettings = ProviderRuntimeSettings()
+    # 中文：变量 `traces` 配置脱敏追踪的详细程度和保留时间。
+    # English: `traces` configures redacted trace detail and retention.
+    traces: TraceSettings = TraceSettings()
+    # 中文：变量 `compatibility` 控制 V4/V5 平滑迁移开关。
+    # English: `compatibility` controls the V4/V5 migration bridge.
+    compatibility: CompatibilitySettings = CompatibilitySettings()
     # 中文：变量 `security` 用于保存“安全”相关数据；其精确定义与约束见下方英文说明。
     # English: Tenant and authentication safeguards.
     security: SecuritySettings = SecuritySettings()
@@ -439,8 +585,12 @@ class Settings(FrozenSettingsModel):
         """
 
         is_production = self.application.environment == "production"
-        if self.config_version != "4.0":
-            raise ValueError("configuration schema version must be 4.0")
+        if self.config_version != "5.0":
+            raise ValueError("configuration schema version must be 5.0")
+        if self.snapshot.ttl_seconds < (
+            self.agent.timeout_seconds + self.snapshot.cleanup_grace_seconds
+        ):
+            raise ValueError("snapshot ttl must cover agent timeout and cleanup grace")
         if is_production and self.security.authentication_mode is AuthenticationMode.DEMO:
             raise ValueError("demo authentication mode is forbidden in production")
         if self.security.demo_auth_enabled != (

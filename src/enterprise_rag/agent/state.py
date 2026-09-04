@@ -10,6 +10,7 @@ from datetime import datetime
 
 from enterprise_rag.core.enums import AgentStatus, IntentType
 from enterprise_rag.domain.models import Citation, RetrievalScope
+from enterprise_rag.domain.questions import QuestionPlan
 from enterprise_rag.retrieval.models import EvidenceBundle
 
 
@@ -42,6 +43,9 @@ class AgentState:
     # 中文：变量 `intent` 用于保存“意图”相关数据；其精确定义与约束见下方英文说明。
     # English: Classified request intent.
     intent: IntentType | None = None
+    # 中文：问题计划分离知识 Need、格式指令和不可丢失锚点。
+    # English: The question plan separates knowledge needs, format instructions, and anchors.
+    question_plan: QuestionPlan | None = None
     # 中文：变量 `retrieval_rounds` 用于保存“检索`rounds`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Number of completed retrieval rounds.

@@ -9,13 +9,14 @@ import tempfile
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 
 from enterprise_rag.api.dependencies import AppContainer, get_container, get_user_context
 from enterprise_rag.api.schemas import (
+    DeletionAcceptedSchema,
     DocumentDetailSchema,
-    IndexBuildResponse,
     IngestionAcceptedSchema,
+    JobDetailSchema,
 )
 from enterprise_rag.domain.models import UserContext
 from enterprise_rag.domain.requests import (
@@ -121,23 +122,51 @@ def document_detail(
     )
 
 
-@router.delete("/{document_id}", response_model=IndexBuildResponse)
+@router.delete(
+    "/{document_id}",
+    response_model=DeletionAcceptedSchema,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def delete_document(
     document_id: str,
     container: Annotated[AppContainer, Depends(get_container)],
     user: Annotated[UserContext, Depends(get_user_context)],
-) -> IndexBuildResponse:
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> DeletionAcceptedSchema:
     """中文：该函数或方法负责“删除文档”相关处理。
 
-    English: Exclude a document immediately and rebuild the active immutable snapshot.
+    English: Revoke retrieval immediately and enqueue durable asynchronous deletion.
     """
 
-    result = container.knowledge.delete_document(user, document_id)
-    return IndexBuildResponse(
-        index_version_id=result.index_version_id,
-        chunk_count=result.chunk_count,
-        activated=result.activated,
-        previous_index_version_id=result.previous_index_version_id,
+    result = container.knowledge.delete_document(user, document_id, idempotency_key)
+    return DeletionAcceptedSchema(
+        deletion_job_id=result.deletion_job_id,
+        document_id=result.document_id,
+        status=result.status,
+    )
+
+
+@router.get("/jobs/{job_id}", response_model=JobDetailSchema)
+def job_detail(
+    job_id: str,
+    container: Annotated[AppContainer, Depends(get_container)],
+    user: Annotated[UserContext, Depends(get_user_context)],
+) -> JobDetailSchema:
+    """中文：返回摄取、删除或重建任务的最新持久状态。
+
+    English: Return the latest durable state of an ingestion, deletion, or rebuild job.
+    """
+
+    result = container.knowledge.job_detail(user, job_id)
+    return JobDetailSchema(
+        job_id=result.job_id,
+        job_type=result.job_type,
+        document_id=result.document_id,
+        document_version_id=result.document_version_id,
+        status=result.status,
+        attempt_count=result.attempt_count,
+        error_code=result.error_code,
+        error_message=result.error_message,
     )
 
 
@@ -150,13 +179,20 @@ def retry_ingestion(
     document_id: str,
     container: Annotated[AppContainer, Depends(get_container)],
     user: Annotated[UserContext, Depends(get_user_context)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> IngestionAcceptedSchema:
     """中文：该函数或方法负责“重试资料接入”相关处理。
 
     English: Enqueue a fresh durable attempt for a failed document.
     """
 
-    result = container.ingestion.retry(RetryIngestionCommand(user=user, document_id=document_id))
+    result = container.ingestion.retry(
+        RetryIngestionCommand(
+            user=user,
+            document_id=document_id,
+            idempotency_key=idempotency_key,
+        )
+    )
     return IngestionAcceptedSchema(
         document_id=result.document_id,
         document_version_id=result.document_version_id,
@@ -174,6 +210,7 @@ def reprocess_document(
     document_id: str,
     container: Annotated[AppContainer, Depends(get_container)],
     user: Annotated[UserContext, Depends(get_user_context)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> IngestionAcceptedSchema:
     """中文：使用资料源当前内容画像对已有原始文件创建新的处理版本。
 
@@ -183,7 +220,11 @@ def reprocess_document(
     # 中文：变量 `result` 包含可由 Worker 恢复执行的新持久化任务标识。
     # English: Result contains a new durable job identity recoverable by the worker.
     result = container.ingestion.reprocess(
-        ReprocessDocumentCommand(user=user, document_id=document_id)
+        ReprocessDocumentCommand(
+            user=user,
+            document_id=document_id,
+            idempotency_key=idempotency_key,
+        )
     )
     return IngestionAcceptedSchema(
         document_id=result.document_id,

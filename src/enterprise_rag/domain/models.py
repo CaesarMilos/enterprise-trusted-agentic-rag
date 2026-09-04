@@ -15,8 +15,11 @@ from enterprise_rag.core.enums import (
     DocumentStatus,
     IndexStatus,
     JobStatus,
+    JobType,
     SourceVisibility,
+    StructureType,
 )
+from enterprise_rag.domain.locators import LocatorBundle
 
 
 def utc_now() -> datetime:
@@ -106,6 +109,12 @@ class RetrievalScope:
     # 其精确定义与约束见下方英文说明。
     # English: Immutable index snapshot selected at the start of the request.
     index_version_id: str | None = None
+    # 中文：请求开始时固定的文档版本集；空集仅供 V4 兼容。
+    # English: Document versions pinned at request start; empty remains V4-compatible.
+    document_version_ids: frozenset[str] = frozenset()
+    # 中文：可选的持久快照租约标识，连接 Trace 与清理策略。
+    # English: Optional persistent snapshot lease identity joining trace and cleanup policy.
+    snapshot_id: str | None = None
 
     def allows(self, tenant_id: str, source_id: str, document_id: str) -> bool:
         """中文：该函数或方法负责“允许”相关处理。
@@ -119,6 +128,14 @@ class RetrievalScope:
         #   identifiers.
         document_allowed = not self.document_ids or document_id in self.document_ids
         return tenant_id == self.tenant_id and source_id in self.source_ids and document_allowed
+
+    def allows_version(self, document_version_id: str) -> bool:
+        """中文：检查不可变版本是否属于请求固定快照。
+
+        English: Check immutable version membership in the request-pinned snapshot.
+        """
+
+        return not self.document_version_ids or document_version_id in self.document_version_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +209,10 @@ class Document:
     # 中文：每次删除请求递增；旧任务必须携带创建时快照才能进行任何持久写入。
     # English: Incremented on deletion; jobs must match their creation-time snapshot to write.
     lifecycle_generation: int = 0
+    # 中文：下一可分配版本号由数据库原子递增；新文档的版本 1 在创建事务中已占用。
+    # English: The database atomically increments the next allocatable version; version one is
+    # consumed by the document-creation transaction.
+    next_version_number: int = 2
     # 中文：删除请求时间用于审计、幂等响应和超时清理。
     # English: Deletion-request time supports auditing, idempotency, and stale-work cleanup.
     delete_requested_at: datetime | None = None
@@ -381,6 +402,16 @@ class Chunk:
     # 中文：变量 `metadata` 用于保存“元数据”相关数据；其精确定义与约束见下方英文说明。
     # English: Additional format-specific values that are safe to index.
     metadata: dict[str, Any] = field(default_factory=dict)
+    # 中文：三层 Locator 允许引用回查原文件、规范化文本和展示锚点。
+    # English: Three-layer locator traces citations to source, normalized, and display positions.
+    locator: LocatorBundle | None = None
+    # 中文：结构节点和类型用于局部窗口、Need 检索和审计。
+    # English: Structure node and type support local windows, need-aware retrieval, and audit.
+    structure_node_id: str | None = None
+    structure_type: StructureType | None = None
+    # 中文：硬边界键禁止上下文扩展跨越独立条款、步骤或故障项。
+    # English: Hard-boundary key prevents context expansion crossing clauses, steps, or faults.
+    hard_boundary_key: str | None = None
 
     @property
     def body_text(self) -> str:
@@ -451,6 +482,12 @@ class IngestionJob:
     # 中文：结构化取消原因用于区分删除、管理员操作和发布冲突。
     # English: A structured reason distinguishes deletion, administration, and publication conflict.
     cancel_reason: str | None = None
+    # 中文：调用方提供的幂等键在同租户、同任务类型范围内唯一。
+    # English: Caller-provided idempotency key is unique within tenant and job type.
+    idempotency_key: str | None = None
+    # 中文：任务类型允许摄取、删除、重建和恢复共享同一可靠队列。
+    # English: Job type lets ingestion, deletion, rebuild, and recovery share one durable queue.
+    job_type: JobType = JobType.INGESTION
     # 中文：变量 `created_at` 用于保存“`created``at`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: Creation timestamp used for FIFO task ordering.
@@ -587,6 +624,22 @@ class IndexManifest:
     # 其精确定义与约束见下方英文说明。
     # English: Relative artifact path to SHA-256 checksum mapping.
     artifact_checksums: dict[str, str]
+    # 中文：V5 审计字段用于解释两次索引构建为何不同。
+    # English: V5 audit fields explain why two index builds differ.
+    schema_version: str = "index-manifest-v5"
+    tokenizer_fingerprint: str = "unicode-codepoint-v1"
+    normalizer_fingerprint: str = "query-normalizer-v1"
+    chunk_strategy_id: str = "mixed"
+    reranker_fingerprint: str = "not-part-of-index"
+    content_profiles: tuple[str, ...] = ()
+    child_content_hashes: dict[str, str] = field(default_factory=dict)
+    parent_child_mapping_fingerprint: str = ""
+    build_parameters_fingerprint: str = ""
+    source_document_fingerprints: dict[str, str] = field(default_factory=dict)
+    # 中文：索引文本策略及向量质量摘要证明 Dense/BM25 输入和发布门禁版本。
+    # English: Index-text strategy and vector-quality summary prove input and gate versions.
+    index_text_strategy_version: str = "index-text-v5.1"
+    vector_quality_report: dict[str, float | int | bool] = field(default_factory=dict)
     # 中文：变量 `created_at` 用于保存“`created``at`”相关数据；
     # 其精确定义与约束见下方英文说明。
     # English: UTC timestamp at which the manifest was finalized.
@@ -657,6 +710,9 @@ class TraceRecord:
     # 其精确定义与约束见下方英文说明。
     # English: Immutable index snapshot used by the request, when applicable.
     index_version_id: str | None = None
+    # 中文：`snapshot_id` 是查询开始时冻结的知识快照，不再只保存在自由属性中。
+    # English: `snapshot_id` is the durable knowledge snapshot pinned at query start.
+    snapshot_id: str | None = None
     # 中文：变量 `attributes` 用于保存“`attributes`”相关数据；其精确定义与约束见下方英文说明。
     # English: Safe structured measurements and decisions.
     attributes: dict[str, Any] = field(default_factory=dict)

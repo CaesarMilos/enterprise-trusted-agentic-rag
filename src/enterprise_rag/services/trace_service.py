@@ -66,6 +66,8 @@ class TraceService:
             return TraceView(
                 trace_id=trace.id,
                 status=trace.status,
+                index_version_id=trace.index_version_id,
+                snapshot_id=trace.snapshot_id,
                 steps=self._load_steps(trace.id),
                 metrics=metrics,
             )

@@ -64,6 +64,34 @@ class DeadlineBudget:
             self._raise_timeout("insufficient_child_budget")
         return timeout
 
+    def child_budget(self, configured_seconds: float, *, stage: str) -> DeadlineBudget:
+        """中文：创建不超过全局剩余时间的单调子预算。
+
+        English: Create a monotonic child budget capped by the global remaining time.
+        """
+
+        timeout = self.timeout_for_call(stage, configured_seconds=configured_seconds)
+        return DeadlineBudget.from_timeout(timeout, clock=self.clock)
+
+    def timeout_for_call(
+        self,
+        stage: str,
+        *,
+        configured_seconds: float | None = None,
+        minimum_seconds: float = 0.001,
+    ) -> float:
+        """中文：返回底层调用可使用的剩余超时，预算不足时拒绝发起调用。
+
+        English: Return timeout available to a lower-level call or reject it before dispatch.
+        """
+
+        self.checkpoint(stage)
+        remaining = self.remaining_seconds()
+        timeout = remaining if configured_seconds is None else min(remaining, configured_seconds)
+        if timeout < minimum_seconds:
+            self._raise_timeout(stage)
+        return timeout
+
     def checkpoint(self, stage: str) -> None:
         """中文：在节点前后执行硬检查，确保迟到结果永远不会作为正常答案返回。
 

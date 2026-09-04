@@ -41,7 +41,12 @@ class LocalEmbeddingProvider:
 
         return f"sentence-transformers:{self._model_name}"
 
-    def embed(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Sequence[Sequence[float]]:
         """中文：该函数或方法负责“向量化”相关处理。
 
         English: Return provider vectors in input order; normalization occurs in
@@ -51,6 +56,10 @@ class LocalEmbeddingProvider:
         # 中文：变量 `model` 用于保存“模型”相关数据；其精确定义与约束见下方英文说明。
         # English: Lazy loading keeps API health checks and non-embedding scripts
         #   lightweight.
+        # 中文：本地推理库不可可靠中断；上层有界执行器负责硬返回和容量保护。
+        # English: Local inference is not reliably interruptible; the bounded caller owns hard
+        # return and capacity protection.
+        _ = timeout_seconds
         model = self._get_model()
         # 中文：变量 `vectors` 用于保存“`vectors`”相关数据；其精确定义与约束见下方英文说明。
         # English: Conversion to list keeps the domain protocol independent of NumPy.

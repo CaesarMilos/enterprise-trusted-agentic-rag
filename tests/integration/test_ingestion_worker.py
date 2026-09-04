@@ -142,6 +142,21 @@ def test_durable_worker_processes_a_text_upload(tmp_path: Path) -> None:
         assert document is not None and document.status is DocumentStatus.READY
         assert job is not None and job.status.value == "succeeded"
         assert chunks
+        assert all(chunk.locator is not None for chunk in chunks)
+        assert all(
+            chunk.locator.normalized.end > chunk.locator.normalized.start
+            for chunk in chunks
+            if chunk.locator is not None
+        )
+        # 中文：质量报告与 Job 状态分表持久化，并反向绑定当前不可变版本。
+        # English: Quality is persisted independently from job state and bound to the version.
+        quality_report = repositories.get_quality_report(
+            "tenant-a",
+            accepted.document_version_id,
+        )
+        assert quality_report is not None
+        assert quality_report.decision.value in {"pass", "pass_with_warnings"}
+        assert quality_report.metrics["chunk_count"] == len(chunks)
 
     # 中文：重新处理创建新版本并复用原始文件，不覆盖首次处理历史。
     # English: Reprocessing creates a new version over the original file without
@@ -154,9 +169,23 @@ def test_durable_worker_processes_a_text_upload(tmp_path: Path) -> None:
                 roles=frozenset({"admin"}),
             ),
             document_id=accepted.document_id,
+            idempotency_key="reprocess-once",
         )
     )
     assert reprocessed.document_version_id != accepted.document_version_id
+    duplicate = service.reprocess(
+        ReprocessDocumentCommand(
+            user=UserContext(
+                user_id="admin-a",
+                tenant_id="tenant-a",
+                roles=frozenset({"admin"}),
+            ),
+            document_id=accepted.document_id,
+            idempotency_key="reprocess-once",
+        )
+    )
+    assert duplicate.job_id == reprocessed.job_id
+    assert duplicate.document_version_id == reprocessed.document_version_id
     assert worker.run_once()
     with transactional_session(sessions) as session:
         repositories = SQLAlchemyRepositories(session)
